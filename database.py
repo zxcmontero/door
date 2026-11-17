@@ -272,7 +272,7 @@ class Database(_DatabaseBase):
         self, user_id: int, only_active: bool = False
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM face_embeddings WHERE user_id = ?"
-        parameters: tuple[Any, ...] = (user_id,)
+        parameters: tuple[Any] = (user_id,)
         if only_active:
             query += " AND is_active = 1"
         query += " ORDER BY created_at DESC"
@@ -410,7 +410,7 @@ class Database(_DatabaseBase):
         async with self.connection() as connection:
             await connection.execute("BEGIN IMMEDIATE;")
             await connection.execute(
-                "UPDATE courier_sessions SET is_active = 0 WHERE user_id = ? AND is_active = 1",
+                "UPDATE courier_sessions SET is_active = 0, unload_mode_until = 0 WHERE user_id = ?",
                 (user_id,),
             )
             cursor = await connection.execute(
@@ -449,7 +449,8 @@ class Database(_DatabaseBase):
     async def enable_unload_mode(self, user_id: int, duration_seconds: int = 600) -> float:
         if duration_seconds <= 0:
             raise ValueError("Длительность режима разгрузки должна быть положительной")
-        until = time.time() + duration_seconds
+        now = time.time()
+        until = now + duration_seconds
         async with self.connection() as connection:
             await connection.execute("BEGIN IMMEDIATE;")
             cursor = await connection.execute(
@@ -461,12 +462,19 @@ class Database(_DatabaseBase):
             )
             row = await cursor.fetchone()
             if row is None:
-                await connection.rollback()
-                raise ValueError("Для пользователя не найдена курьерская сессия")
-            await connection.execute(
-                "UPDATE courier_sessions SET unload_mode_until = ? WHERE id = ?",
-                (until, row["id"]),
-            )
+                await connection.execute(
+                    """
+                    INSERT INTO courier_sessions
+                        (user_id, expires_at, unload_mode_until, is_active, created_at)
+                    VALUES (?, ?, ?, 0, ?)
+                    """,
+                    (user_id, now, until, now),
+                )
+            else:
+                await connection.execute(
+                    "UPDATE courier_sessions SET unload_mode_until = ? WHERE id = ?",
+                    (until, row["id"]),
+                )
             await connection.commit()
             return until
 
@@ -833,7 +841,7 @@ class SyncDatabase(_DatabaseBase):
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE;")
             connection.execute(
-                "UPDATE courier_sessions SET is_active = 0 WHERE user_id = ? AND is_active = 1",
+                "UPDATE courier_sessions SET is_active = 0, unload_mode_until = 0 WHERE user_id = ?",
                 (user_id,),
             )
             cursor = connection.execute(
@@ -900,7 +908,8 @@ class SyncDatabase(_DatabaseBase):
     def enable_unload_mode(self, user_id: int, duration_seconds: int = 600) -> float:
         if duration_seconds <= 0:
             raise ValueError("Длительность режима разгрузки должна быть положительной")
-        until = time.time() + duration_seconds
+        now = time.time()
+        until = now + duration_seconds
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE;")
             row = connection.execute(
@@ -911,12 +920,19 @@ class SyncDatabase(_DatabaseBase):
                 (user_id,),
             ).fetchone()
             if row is None:
-                connection.rollback()
-                raise ValueError("Для пользователя не найдена курьерская сессия")
-            connection.execute(
-                "UPDATE courier_sessions SET unload_mode_until = ? WHERE id = ?",
-                (until, row["id"]),
-            )
+                connection.execute(
+                    """
+                    INSERT INTO courier_sessions
+                        (user_id, expires_at, unload_mode_until, is_active, created_at)
+                    VALUES (?, ?, ?, 0, ?)
+                    """,
+                    (user_id, now, until, now),
+                )
+            else:
+                connection.execute(
+                    "UPDATE courier_sessions SET unload_mode_until = ? WHERE id = ?",
+                    (until, row["id"]),
+                )
             connection.commit()
             return until
 
