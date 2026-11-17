@@ -401,6 +401,20 @@ class Database(_DatabaseBase):
             await connection.commit()
             return QRConsumeResult(True, "ok", result)
 
+    async def refund_qr_use(self, qr_id: int, expected_used_count: int) -> bool:
+        if expected_used_count <= 0:
+            raise ValueError("expected_used_count должен быть положительным")
+        async with self.connection() as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE qr_tokens SET used_count = MAX(0, used_count - 1)
+                WHERE id = ? AND used_count = ?
+                """,
+                (qr_id, expected_used_count),
+            )
+            await connection.commit()
+            return cursor.rowcount > 0
+
     async def create_courier_session(
         self, user_id: int, duration_seconds: int
     ) -> int:
@@ -833,6 +847,20 @@ class SyncDatabase(_DatabaseBase):
             result["used_count"] += 1
             connection.commit()
             return QRConsumeResult(True, "ok", result)
+
+    def refund_qr_use(self, qr_id: int, expected_used_count: int) -> bool:
+        if expected_used_count <= 0:
+            raise ValueError("expected_used_count должен быть положительным")
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE qr_tokens SET used_count = MAX(0, used_count - 1)
+                WHERE id = ? AND used_count = ?
+                """,
+                (qr_id, expected_used_count),
+            )
+            connection.commit()
+            return cursor.rowcount > 0
 
     def create_courier_session(self, user_id: int, duration_seconds: int) -> int:
         if duration_seconds <= 0:

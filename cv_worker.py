@@ -504,21 +504,14 @@ class CVWorker:
         try:
             opened = await self.unlock_door(event)
         except Exception:
-            await asyncio.to_thread(self._refund_qr_use, int(qr["id"]), int(qr["used_count"]))
+            await asyncio.to_thread(
+                self.db.refund_qr_use, int(qr["id"]), int(qr["used_count"])
+            )
             raise
         if not opened:
-            await asyncio.to_thread(self._refund_qr_use, int(qr["id"]), int(qr["used_count"]))
-
-    def _refund_qr_use(self, qr_id: int, expected_used_count: int) -> None:
-        with self.db.connection() as connection:
-            connection.execute(
-                """
-                UPDATE qr_tokens SET used_count = MAX(0, used_count - 1)
-                WHERE id = ? AND used_count = ?
-                """,
-                (qr_id, expected_used_count),
+            await asyncio.to_thread(
+                self.db.refund_qr_use, int(qr["id"]), int(qr["used_count"])
             )
-            connection.commit()
 
     def _person_is_close(self) -> bool:
         return bool(self._last_faces) and time.time() - self._last_faces_frame_ts <= 3.0
@@ -714,13 +707,35 @@ class CVWorker:
                 method = str(payload.get("method", "button"))
                 if method not in METHOD_NAMES:
                     raise ValueError(f"Недопустимый метод открытия: {method}")
-                opened = await self.unlock_door(
-                    EntryEvent(
-                        method=method,
-                        user_id=user_id,
-                        details=str(payload.get("details", "Команда из Telegram")),
-                    )
+                qr_refund: tuple[int, int] | None = None
+                courier_session_id: int | None = None
+                if method == "qr_deeplink":
+                    qr_id = int(payload["qr_id"])
+                    expected_used_count = int(payload["expected_used_count"])
+                    if qr_id <= 0 or expected_used_count <= 0:
+                        raise ValueError("Некорректные данные возврата QR-использования")
+                    qr_refund = (qr_id, expected_used_count)
+                    if payload.get("courier_session_id") is not None:
+                        courier_session_id = int(payload["courier_session_id"])
+                        if courier_session_id <= 0:
+                            raise ValueError("Некорректный ID курьерской сессии")
+                entry = EntryEvent(
+                    method=method,
+                    user_id=user_id,
+                    details=str(payload.get("details", "Команда из Telegram")),
                 )
+                try:
+                    opened = await self.unlock_door(entry)
+                except Exception:
+                    if qr_refund is not None:
+                        await asyncio.to_thread(self.db.refund_qr_use, *qr_refund)
+                    raise
+                if not opened and qr_refund is not None:
+                    await asyncio.to_thread(self.db.refund_qr_use, *qr_refund)
+                if opened and courier_session_id is not None:
+                    await asyncio.to_thread(
+                        self.db.set_courier_session_active, courier_session_id, False
+                    )
                 if not opened and chat_id is not None:
                     remaining = max(
                         0,
@@ -828,12 +843,16 @@ class CVWorker:
         frames: list[VideoFrame] = []
         deadline = time.monotonic() + duration
         last_timestamp = after_timestamp
+        sample_interval = 1.0 / self.settings.rtsp_fps
+        next_sample_timestamp = after_timestamp + sample_interval
         while time.monotonic() < deadline:
             frame = self.capture.latest()
             if frame is not None and frame.timestamp > last_timestamp:
-                frames.append(frame)
                 last_timestamp = frame.timestamp
-            await asyncio.sleep(min(1.0 / self.settings.rtsp_fps, max(0.001, deadline - time.monotonic())))
+                if frame.timestamp >= next_sample_timestamp:
+                    frames.append(frame)
+                    next_sample_timestamp = frame.timestamp + sample_interval
+            await asyncio.sleep(min(sample_interval, max(0.001, deadline - time.monotonic())))
         return frames
 
     async def _post_roll_identities(self, frames: list[VideoFrame]) -> list[tuple[np.ndarray, bool]]:
