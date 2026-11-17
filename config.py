@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import os
+import tempfile
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import quote
+
+from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+
+class ConfigError(ValueError):
+    """Ошибка конфигурации приложения."""
+
+
+def _required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise ConfigError(f"Не задана обязательная переменная окружения {name}")
+    return value
+
+
+def _path(name: str, default: str) -> Path:
+    raw_value = os.getenv(name, default).strip()
+    path = Path(raw_value).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+def _integer(name: str, default: int | None = None) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        if default is None:
+            raise ConfigError(f"Не задана обязательная переменная окружения {name}")
+        return default
+    try:
+        return int(raw_value.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} должен быть целым числом") from exc
+
+
+def _positive_integer(name: str, default: int) -> int:
+    value = _integer(name, default)
+    if value <= 0:
+        raise ConfigError(f"{name} должен быть больше нуля")
+    return value
+
+
+def _positive_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = float(raw_value.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{name} должен быть числом") from exc
+    if value <= 0:
+        raise ConfigError(f"{name} должен быть больше нуля")
+    return value
+
+
+def _parse_admin_ids() -> frozenset[int]:
+    raw_value = _required("ADMIN_IDS")
+    admin_ids: set[int] = set()
+    for item in raw_value.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            admin_ids.add(int(item))
+        except ValueError as exc:
+            raise ConfigError(f"Некорректный Telegram ID в ADMIN_IDS: {item}") from exc
+    if not admin_ids:
+        raise ConfigError("ADMIN_IDS должен содержать хотя бы один Telegram ID")
+    return frozenset(admin_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class Settings:
+    bot_token: str
+    bot_username: str
+    admin_ids: frozenset[int]
+    log_chat_id: int | None
+    dahua_ip: str
+    dahua_user: str
+    dahua_password: str
+    dahua_rtsp_port: int
+    database_path: Path
+    media_dir: Path
+    face_tasks_dir: Path
+    temp_media_dir: Path
+    rtsp_fps: int
+    pre_roll_seconds: int
+    post_roll_seconds: int
+    live_clip_seconds: int
+    face_analysis_interval: float
+    face_similarity_threshold: float
+    face_cooldown_seconds: float
+    door_unlock_cooldown_seconds: float
+    courier_face_ttl_seconds: int
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        dahua_ip = _required("DAHUA_IP").rstrip("/")
+        if "://" in dahua_ip:
+            raise ConfigError("DAHUA_IP должен содержать только адрес устройства, без http://")
+        log_chat_id_raw = os.getenv("LOG_CHAT_ID", "").strip()
+        log_chat_id = _integer("LOG_CHAT_ID") if log_chat_id_raw else None
+        similarity = _positive_float("FACE_SIMILARITY_THRESHOLD", 0.48)
+        if similarity > 1.0:
+            raise ConfigError("FACE_SIMILARITY_THRESHOLD не может быть больше 1.0")
+        return cls(
+            bot_token=_required("BOT_TOKEN"),
+            bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@"),
+            admin_ids=_parse_admin_ids(),
+            log_chat_id=log_chat_id,
+            dahua_ip=dahua_ip,
+            dahua_user=_required("DAHUA_USER"),
+            dahua_password=_required("DAHUA_PASS"),
+            dahua_rtsp_port=_positive_integer("DAHUA_RTSP_PORT", 554),
+            database_path=_path("DATABASE_PATH", "data/access.db"),
+            media_dir=_path("MEDIA_DIR", "data/media"),
+            face_tasks_dir=_path("FACE_TASKS_DIR", "data/face_tasks"),
+            temp_media_dir=_path("TEMP_MEDIA_DIR", tempfile.gettempdir()),
+            rtsp_fps=_positive_integer("RTSP_FPS", 10),
+            pre_roll_seconds=_positive_integer("PRE_ROLL_SECONDS", 3),
+            post_roll_seconds=_positive_integer("POST_ROLL_SECONDS", 5),
+            live_clip_seconds=_positive_integer("LIVE_CLIP_SECONDS", 4),
+            face_analysis_interval=_positive_float("FACE_ANALYSIS_INTERVAL", 0.2),
+            face_similarity_threshold=similarity,
+            face_cooldown_seconds=_positive_float("FACE_COOLDOWN_SECONDS", 20.0),
+            door_unlock_cooldown_seconds=_positive_float("DOOR_UNLOCK_COOLDOWN_SECONDS", 8.0),
+            courier_face_ttl_seconds=_positive_integer("COURIER_FACE_TTL_SECONDS", 600),
+        )
+
+    @property
+    def dahua_base_url(self) -> str:
+        return f"http://{self.dahua_ip}"
+
+    @property
+    def rtsp_url(self) -> str:
+        user = quote(self.dahua_user, safe="")
+        password = quote(self.dahua_password, safe="")
+        return (
+            f"rtsp://{user}:{password}@{self.dahua_ip}:{self.dahua_rtsp_port}"
+            "/cam/realmonitor?channel=1&subtype=0"
+        )
+
+    def ensure_directories(self) -> None:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self.face_tasks_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_media_dir.mkdir(parents=True, exist_ok=True)
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    settings = Settings.from_env()
+    settings.ensure_directories()
+    return settings
