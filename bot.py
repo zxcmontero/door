@@ -23,6 +23,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     FSInputFile,
@@ -44,6 +45,19 @@ QR_REASON_MESSAGES = {
     "expired": "Срок действия QR-кода истек",
     "exhausted": "Лимит использований QR-кода исчерпан",
 }
+BUTTON_UNLOCK = "🔓 Открыть дверь"
+BUTTON_CAMERA = "📹 Камера"
+BUTTON_COURIER = "🍕 Курьер"
+BUTTON_QR = "🎟 Пропуска"
+BUTTON_FACES = "👥 Лица"
+BUTTON_ADMIN = "🛡 Админ-панель"
+HOME_TEXT = "🏠 Домофон\n\nВыберите действие кнопками ниже."
+MAX_QR_TTL_MINUTES = 365 * 1440
+QR_TYPE_NAMES = {
+    "permanent": "♾️ Бессрочный",
+    "temporary": "⏳ Временный",
+    "courier": "📦 Курьерский",
+}
 
 
 class QRStates(StatesGroup):
@@ -51,6 +65,7 @@ class QRStates(StatesGroup):
     kind = State()
     max_uses = State()
     ttl = State()
+    ttl_value = State()
 
 
 class FaceStates(StatesGroup):
@@ -65,9 +80,8 @@ class AdminStates(StatesGroup):
 
 class DoorBot:
     def __init__(self, settings: Settings) -> None:
-        if not settings.bot_username:
-            raise ValueError("Для QR и курьерских deep links необходимо задать BOT_USERNAME")
         self.settings = settings
+        self.bot_username = settings.bot_username
         self.db = Database(settings.database_path)
         self.bot = Bot(token=settings.bot_token)
         self.router = Router()
@@ -79,16 +93,28 @@ class DoorBot:
         router = self.router
         router.message.register(self.on_start, CommandStart())
         router.message.register(self.on_cancel, Command("cancel"))
+        router.message.register(self.on_menu, Command("menu"))
         router.callback_query.register(self.on_fsm_cancel, F.data == "fsm_cancel")
+        router.callback_query.register(self.on_nav_main, F.data == "nav:main")
+        router.callback_query.register(self.on_nav_qr, F.data == "nav:qr")
+        router.callback_query.register(self.on_nav_faces, F.data == "nav:faces")
+        router.callback_query.register(self.on_nav_admin, F.data == "nav:admin")
 
         router.callback_query.register(self.on_inline_unlock, F.data == "unlock_door")
         router.callback_query.register(self.on_inline_unlock_unload, F.data == "unlock_unload:10")
         router.callback_query.register(self.on_courier_unload, F.data == "courier_unload:10")
         router.callback_query.register(self.on_deeplink_retry, F.data.startswith("deeplink_retry:"))
         router.callback_query.register(self.on_courier_start, F.data.startswith("courier_start:"))
+        router.callback_query.register(self.on_courier_resend, F.data == "courier_resend")
 
         router.callback_query.register(self.on_qr_create, F.data == "qr_create")
         router.callback_query.register(self.on_qr_kind, F.data.startswith("qr_kind:"), QRStates.kind)
+        router.callback_query.register(self.on_qr_limit, F.data.startswith("qr_limit:"), QRStates.max_uses)
+        router.callback_query.register(self.on_qr_ttl_preset, F.data.startswith("qr_ttl:"), QRStates.ttl)
+        router.callback_query.register(self.on_qr_ttl_unit, F.data.startswith("qr_ttl_unit:"), QRStates.ttl)
+        router.callback_query.register(self.on_qr_ttl_finish, F.data == "qr_ttl_finish", QRStates.ttl)
+        router.callback_query.register(self.on_qr_ttl_reset, F.data == "qr_ttl_reset", QRStates.ttl)
+        router.callback_query.register(self.on_qr_ttl_back, F.data == "qr_ttl_back", QRStates.ttl_value)
         router.callback_query.register(self.on_qr_view, F.data.startswith("qr_view:"))
         router.callback_query.register(self.on_qr_revoke, F.data.startswith("qr_revoke:"))
         router.callback_query.register(self.on_face_add, F.data == "face_add")
@@ -98,24 +124,27 @@ class DoorBot:
         router.callback_query.register(self.on_admin_block, F.data == "admin_block")
         router.callback_query.register(self.on_admin_logs, F.data == "admin_logs")
         router.callback_query.register(self.on_admin_qrs, F.data == "admin_qrs")
+        router.callback_query.register(self.on_admin_users, F.data == "admin_users")
+        router.callback_query.register(self.on_user_view, F.data.startswith("user_view:"))
         router.callback_query.register(self.on_admin_qr_revoke, F.data.startswith("admin_qr_revoke:"))
         router.callback_query.register(self.on_log_video, F.data.startswith("log_video:"))
 
         router.message.register(self.on_qr_name, QRStates.name, F.text)
         router.message.register(self.on_qr_max_uses, QRStates.max_uses, F.text)
         router.message.register(self.on_qr_ttl, QRStates.ttl, F.text)
+        router.message.register(self.on_qr_ttl_value, QRStates.ttl_value, F.text)
         router.message.register(self.on_face_name, FaceStates.name, F.text)
         router.message.register(self.on_face_photo, FaceStates.photo, F.photo)
         router.message.register(self.on_face_photo_invalid, FaceStates.photo)
         router.message.register(self.on_admin_add_id, AdminStates.add_user, F.text)
         router.message.register(self.on_admin_block_id, AdminStates.block_user, F.text)
 
-        router.message.register(self.on_unlock_text, F.text == "🔓 Открыть дверь")
-        router.message.register(self.on_courier_menu, F.text == "🍕 Жду курьера")
-        router.message.register(self.on_live_text, F.text == "📹 Что у двери?")
-        router.message.register(self.on_qr_menu, F.text == "🎟 Мои QR-коды")
-        router.message.register(self.on_face_menu, F.text == "👤 Мои лица")
-        router.message.register(self.on_admin_menu, F.text == "⚙️ Админ-панель")
+        router.message.register(self.on_unlock_text, F.text == BUTTON_UNLOCK)
+        router.message.register(self.on_courier_menu, F.text == BUTTON_COURIER)
+        router.message.register(self.on_live_text, F.text == BUTTON_CAMERA)
+        router.message.register(self.on_qr_menu, F.text == BUTTON_QR)
+        router.message.register(self.on_face_menu, F.text == BUTTON_FACES)
+        router.message.register(self.on_admin_menu, F.text == BUTTON_ADMIN)
         router.message.register(self.on_fallback, F.text)
 
     async def _get_role(self, telegram_id: int) -> str | None:
@@ -154,23 +183,43 @@ class DoorBot:
     def _callback_message(callback: CallbackQuery) -> Message | None:
         return callback.message if isinstance(callback.message, Message) else None
 
+    async def _edit_message(
+        self, message: Message, text: str, reply_markup: InlineKeyboardMarkup
+    ) -> None:
+        try:
+            await message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            try:
+                await message.delete()
+            except TelegramBadRequest as delete_error:
+                logger.debug("Не удалось удалить старое сообщение меню: %s", delete_error)
+            await message.answer(text, reply_markup=reply_markup)
+
     @staticmethod
     def _main_keyboard(role: str) -> Any:
         builder = ReplyKeyboardBuilder()
-        builder.button(text="🔓 Открыть дверь")
-        builder.button(text="🍕 Жду курьера")
-        builder.button(text="📹 Что у двери?")
-        builder.button(text="🎟 Мои QR-коды")
-        builder.button(text="👤 Мои лица")
+        builder.button(text=BUTTON_UNLOCK)
+        builder.button(text=BUTTON_CAMERA)
+        builder.button(text=BUTTON_COURIER)
+        builder.button(text=BUTTON_QR)
+        builder.button(text=BUTTON_FACES)
         if role == "admin":
-            builder.button(text="⚙️ Админ-панель")
+            builder.button(text=BUTTON_ADMIN)
         builder.adjust(1, 2, 2, 1)
-        return builder.as_markup(resize_keyboard=True)
+        return builder.as_markup(
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Выберите действие…",
+        )
 
     @staticmethod
-    def _cancel_keyboard() -> InlineKeyboardMarkup:
+    def _cancel_keyboard(back: str = "nav:main") -> InlineKeyboardMarkup:
         builder = InlineKeyboardBuilder()
-        builder.button(text="Отмена", callback_data="fsm_cancel")
+        builder.button(text="⬅️ Назад", callback_data=back)
+        builder.button(text="✖️ Отмена", callback_data="fsm_cancel")
+        builder.adjust(2)
         return builder.as_markup()
 
     async def on_start(self, message: Message, command: CommandObject, state: FSMContext) -> None:
@@ -193,7 +242,15 @@ class DoorBot:
         if role not in {"admin", "resident"}:
             await message.answer("Ваш Telegram ID не зарегистрирован. Передайте его администратору.")
             return
-        await message.answer("Управление домофоном", reply_markup=self._main_keyboard(role))
+        await message.answer(HOME_TEXT, reply_markup=self._main_keyboard(role))
+
+    async def on_menu(self, message: Message, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_message(message) or message.from_user is None:
+            return
+        role = await self._get_role(message.from_user.id)
+        if role in {"admin", "resident"}:
+            await message.answer(HOME_TEXT, reply_markup=self._main_keyboard(role))
 
     async def on_cancel(self, message: Message, state: FSMContext) -> None:
         await state.clear()
@@ -208,7 +265,47 @@ class DoorBot:
         await callback.answer("Отменено")
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer("Действие отменено.")
+            role = await self._get_role(callback.from_user.id)
+            if role in {"admin", "resident"}:
+                await message.answer(HOME_TEXT, reply_markup=self._main_keyboard(role))
+
+    async def on_nav_main(self, callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_callback(callback):
+            return
+        message = self._callback_message(callback)
+        if message is not None:
+            role = await self._get_role(callback.from_user.id)
+            if role in {"admin", "resident"}:
+                await message.answer(HOME_TEXT, reply_markup=self._main_keyboard(role))
+        await callback.answer()
+
+    async def on_nav_qr(self, callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_callback(callback):
+            return
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_qr_menu(message, callback.from_user.id, edit=True)
+        await callback.answer()
+
+    async def on_nav_faces(self, callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_callback(callback):
+            return
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_face_menu(message, callback.from_user.id, edit=True)
+        await callback.answer()
+
+    async def on_nav_admin(self, callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_callback(callback, admin=True):
+            return
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_admin_menu(message, edit=True)
+        await callback.answer()
 
     async def on_unlock_text(self, message: Message) -> None:
         if not await self._require_message(message) or message.from_user is None:
@@ -270,16 +367,29 @@ class DoorBot:
     async def on_courier_menu(self, message: Message) -> None:
         if not await self._require_message(message) or message.from_user is None:
             return
+        await self._close_expired_courier_qrs(message.from_user.id)
         active = await self.db.get_active_courier_session(message.from_user.id)
         if active is not None:
             remaining = max(1, int((float(active["expires_at"]) - time.time()) / 60))
-            await message.answer(f"Режим ожидания курьера уже активен, осталось около {remaining} мин.")
+            builder = InlineKeyboardBuilder()
+            builder.button(text="🎟 Показать QR еще раз", callback_data="courier_resend")
+            builder.button(text="🏠 Главное меню", callback_data="nav:main")
+            builder.adjust(1)
+            await message.answer(
+                f"📦 Курьерский режим\n\nАктивен, осталось около {remaining} мин.\n"
+                "QR и текст для заказа можно получить повторно без поиска по истории.",
+                reply_markup=builder.as_markup(),
+            )
             return
         builder = InlineKeyboardBuilder()
         for minutes in (15, 30, 60):
-            builder.button(text=f"{minutes} минут", callback_data=f"courier_start:{minutes}")
-        builder.adjust(3)
-        await message.answer("На какое время включить ожидание курьера?", reply_markup=builder.as_markup())
+            builder.button(text=f"{minutes} мин", callback_data=f"courier_start:{minutes}")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(3, 1)
+        await message.answer(
+            "🍕 Ожидание курьера\n\nВыберите, сколько времени режим будет активен:",
+            reply_markup=builder.as_markup(),
+        )
 
     async def on_courier_start(self, callback: CallbackQuery) -> None:
         if not await self._require_callback(callback):
@@ -313,17 +423,64 @@ class DoorBot:
             logger.exception("Не удалось создать курьерский QR: %s", exc)
             await callback.answer("Сессия создана, но ссылка недоступна", show_alert=True)
             return
-        link = build_deep_link(self.settings.bot_username, token, "cour")
+        await self._send_courier_pass(message, token, minutes)
+        await callback.answer("Режим включен")
+
+    async def _get_courier_token(
+        self, user_id: int, session: dict[str, Any]
+    ) -> str | None:
+        tokens = await self.db.list_qr_tokens(user_id)
+        for qr in tokens:
+            if (
+                qr["qr_type"] == "courier"
+                and self._qr_rejection_reason(qr) is None
+                and float(qr["created_at"]) >= float(session["created_at"]) - 1.0
+            ):
+                return str(qr["token"])
+        return None
+
+    async def _send_courier_pass(self, message: Message, token: str, minutes: int) -> None:
+        link = build_deep_link(self.bot_username, token, "cour")
         comment = (
             "Домофон откроется сам при нажатии кнопки вызова на панели, "
             f"либо нажмите у двери: {link}"
         )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🎟 Показать QR еще раз", callback_data="courier_resend")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
         await message.answer_photo(
             BufferedInputFile(render_qr_png(token), filename=f"courier_{token}.png"),
-            caption=f"🍕 Ожидание курьера включено на {minutes} минут.",
+            caption=f"📦 Курьерский пропуск\n\nОсталось около {minutes} мин.",
+            reply_markup=builder.as_markup(),
         )
         await message.answer(comment)
-        await callback.answer("Режим включен")
+
+    async def on_courier_resend(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback):
+            return
+        message = self._callback_message(callback)
+        if message is None:
+            await callback.answer("Сообщение недоступно", show_alert=True)
+            return
+        user_id = callback.from_user.id
+        await self._close_expired_courier_qrs(user_id)
+        session = await self.db.get_active_courier_session(user_id)
+        if session is None:
+            await callback.answer("Курьерский режим не активен", show_alert=True)
+            return
+        token = await self._get_courier_token(user_id, session)
+        remaining_seconds = max(1, int(float(session["expires_at"]) - time.time()))
+        if token is None:
+            _, token = await self._create_unique_qr(
+                creator_id=user_id,
+                label=f"Курьер {time.strftime('%d.%m.%Y %H:%M')}",
+                qr_type="courier",
+                max_uses=1,
+                expires_at=time.time() + remaining_seconds,
+            )
+        await self._send_courier_pass(message, token, max(1, remaining_seconds // 60))
+        await callback.answer("QR и текст отправлены")
 
     async def _handle_deep_link(
         self, message: Message, token: str, kind: str, initiator_id: int
@@ -412,13 +569,30 @@ class DoorBot:
     def _qr_rejection_reason(qr: dict[str, Any] | None) -> str | None:
         if qr is None:
             return "not_found"
-        if not qr["is_active"]:
-            return "inactive"
         if qr["expires_at"] is not None and float(qr["expires_at"]) <= time.time():
             return "expired"
+        if not qr["is_active"]:
+            return "inactive"
         if int(qr["max_uses"]) > 0 and int(qr["used_count"]) >= int(qr["max_uses"]):
             return "exhausted"
         return None
+
+    async def _close_expired_courier_qrs(self, user_id: int | None = None) -> int:
+        tokens = await self.db.list_qr_tokens(user_id)
+        closed = 0
+        now = time.time()
+        for qr in tokens:
+            if (
+                qr["qr_type"] == "courier"
+                and qr["is_active"]
+                and qr["expires_at"] is not None
+                and float(qr["expires_at"]) <= now
+            ):
+                changed = await self.db.set_qr_token_active(
+                    int(qr["id"]), False, user_id
+                )
+                closed += int(changed)
+        return closed
 
     async def _create_unique_qr(
         self,
@@ -442,20 +616,31 @@ class DoorBot:
     async def on_qr_menu(self, message: Message) -> None:
         if not await self._require_message(message) or message.from_user is None:
             return
-        tokens = await self.db.list_qr_tokens(message.from_user.id)
+        await self._send_qr_menu(message, message.from_user.id)
+
+    async def _send_qr_menu(self, message: Message, user_id: int, edit: bool = False) -> None:
+        await self._close_expired_courier_qrs(user_id)
+        tokens = await self.db.list_qr_tokens(user_id)
         builder = InlineKeyboardBuilder()
         for qr in tokens[:20]:
-            status = "✅" if qr["is_active"] else "🚫"
+            status = "🟢" if self._qr_rejection_reason(qr) is None else "⚪"
+            type_icon = QR_TYPE_NAMES.get(str(qr["qr_type"]), "🎟").split()[0]
             builder.button(
-                text=f"{status} {qr['label']}",
+                text=f"{status} {type_icon} {str(qr['label'])[:40]}",
                 callback_data=f"qr_view:{qr['id']}",
             )
-        builder.button(text="➕ Создать QR", callback_data="qr_create")
+        builder.button(text="➕ Новый пропуск", callback_data="qr_create")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
-        await message.answer(
-            "Ваши QR-коды:" if tokens else "У вас пока нет QR-кодов.",
-            reply_markup=builder.as_markup(),
+        text = (
+            "🎟 Пропуска\n\nВыберите пропуск для просмотра или создайте новый."
+            if tokens
+            else "🎟 Пропуска\n\nЗдесь появятся ваши QR-коды. Создайте первый пропуск."
         )
+        if edit:
+            await self._edit_message(message, text, builder.as_markup())
+        else:
+            await message.answer(text, reply_markup=builder.as_markup())
 
     async def on_qr_create(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback):
@@ -464,7 +649,11 @@ class DoorBot:
         await state.set_state(QRStates.name)
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer("Введите название пропуска (1–64 символа):", reply_markup=self._cancel_keyboard())
+            await self._edit_message(
+                message,
+                "🎟 Новый пропуск\n\nВведите понятное название, например «Гость» или «Сантехник»:",
+                self._cancel_keyboard("nav:qr"),
+            )
         await callback.answer()
 
     async def on_qr_name(self, message: Message, state: FSMContext) -> None:
@@ -477,11 +666,79 @@ class DoorBot:
         await state.update_data(name=name)
         await state.set_state(QRStates.kind)
         builder = InlineKeyboardBuilder()
-        builder.button(text="Постоянный", callback_data="qr_kind:permanent")
-        builder.button(text="Временный", callback_data="qr_kind:temporary")
-        builder.button(text="Отмена", callback_data="fsm_cancel")
-        builder.adjust(2, 1)
-        await message.answer("Выберите тип QR:", reply_markup=builder.as_markup())
+        builder.button(text="♾️ Бессрочный", callback_data="qr_kind:permanent")
+        builder.button(text="⏳ По сроку", callback_data="qr_kind:temporary")
+        builder.button(text="⬅️ Назад", callback_data="nav:qr")
+        builder.button(text="✖️ Отмена", callback_data="fsm_cancel")
+        builder.adjust(2, 2)
+        await message.answer(
+            f"🎟 {name}\n\n♾️ Бессрочный не имеет срока действия.\n⏳ По сроку можно настроить месяцы, дни, часы и минуты.",
+            reply_markup=builder.as_markup(),
+        )
+
+    @staticmethod
+    def _qr_limit_keyboard() -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="1 вход", callback_data="qr_limit:1")
+        builder.button(text="5 входов", callback_data="qr_limit:5")
+        builder.button(text="∞ Безлимит", callback_data="qr_limit:0")
+        builder.button(text="⬅️ Назад", callback_data="nav:qr")
+        builder.button(text="✖️ Отмена", callback_data="fsm_cancel")
+        builder.adjust(3, 2)
+        return builder.as_markup()
+
+    @staticmethod
+    def _qr_ttl_keyboard() -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="30 мин", callback_data="qr_ttl:30")
+        builder.button(text="2 часа", callback_data="qr_ttl:120")
+        builder.button(text="6 часов", callback_data="qr_ttl:360")
+        builder.button(text="24 часа", callback_data="qr_ttl:1440")
+        builder.button(text="3 дня", callback_data="qr_ttl:4320")
+        builder.button(text="7 дней", callback_data="qr_ttl:10080")
+        builder.button(text="📆 Месяцы", callback_data="qr_ttl_unit:months")
+        builder.button(text="📅 Дни", callback_data="qr_ttl_unit:days")
+        builder.button(text="🕐 Часы", callback_data="qr_ttl_unit:hours")
+        builder.button(text="⏱ Минуты", callback_data="qr_ttl_unit:minutes")
+        builder.button(text="✅ Создать пропуск", callback_data="qr_ttl_finish")
+        builder.button(text="🧹 Сбросить", callback_data="qr_ttl_reset")
+        builder.button(text="⬅️ Назад", callback_data="nav:qr")
+        builder.button(text="✖️ Отмена", callback_data="fsm_cancel")
+        builder.adjust(3, 3, 4, 1, 3)
+        return builder.as_markup()
+
+    @staticmethod
+    def _qr_ttl_text(data: dict[str, Any]) -> str:
+        months = int(data.get("ttl_months", 0))
+        days = int(data.get("ttl_days", 0))
+        hours = int(data.get("ttl_hours", 0))
+        minutes = int(data.get("ttl_minutes", 0))
+        parts = []
+        if months:
+            parts.append(f"{months} мес.")
+        if days:
+            parts.append(f"{days} дн.")
+        if hours:
+            parts.append(f"{hours} ч.")
+        if minutes:
+            parts.append(f"{minutes} мин.")
+        total = " + ".join(parts) if parts else "не выбран"
+        return (
+            "⏳ Срок действия\n\n"
+            f"📆 Месяцы: {months} (по 30 дней)\n📅 Дни: {days}\n"
+            f"🕐 Часы: {hours}\n⏱ Минуты: {minutes}\n\n"
+            f"Итого: {total}\n\n"
+            "Выберите пресет, настройте единицы отдельно или введите общее число минут."
+        )
+
+    @staticmethod
+    def _qr_total_minutes(data: dict[str, Any]) -> int:
+        return (
+            int(data.get("ttl_months", 0)) * 43200
+            + int(data.get("ttl_days", 0)) * 1440
+            + int(data.get("ttl_hours", 0)) * 60
+            + int(data.get("ttl_minutes", 0))
+        )
 
     async def on_qr_kind(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback):
@@ -494,10 +751,33 @@ class DoorBot:
         await state.set_state(QRStates.max_uses)
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer(
-                "Введите максимальное число использований: 0 — безлимит, иначе целое число от 1 до 10000.",
-                reply_markup=self._cancel_keyboard(),
+            await self._edit_message(
+                message,
+                f"{QR_TYPE_NAMES[kind]}\n\nВыберите лимит или введите свое число от 0 до 10000.",
+                self._qr_limit_keyboard(),
             )
+        await callback.answer()
+
+    async def on_qr_limit(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        try:
+            max_uses = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный лимит", show_alert=True)
+            return
+        if max_uses not in {0, 1, 5}:
+            await callback.answer("Некорректный лимит", show_alert=True)
+            return
+        await state.update_data(max_uses=max_uses)
+        data = await state.get_data()
+        message = self._callback_message(callback)
+        if data.get("kind") == "temporary":
+            await state.set_state(QRStates.ttl)
+            if message is not None:
+                await self._edit_message(message, self._qr_ttl_text(data), self._qr_ttl_keyboard())
+        elif message is not None:
+            await self._finish_qr_creation(message, state, callback.from_user.id)
         await callback.answer()
 
     async def on_qr_max_uses(self, message: Message, state: FSMContext) -> None:
@@ -514,12 +794,112 @@ class DoorBot:
         data = await state.get_data()
         if data.get("kind") == "temporary":
             await state.set_state(QRStates.ttl)
-            await message.answer(
-                "Введите срок действия в минутах (1–10080):",
-                reply_markup=self._cancel_keyboard(),
-            )
+            await message.answer(self._qr_ttl_text(data), reply_markup=self._qr_ttl_keyboard())
             return
         await self._finish_qr_creation(message, state)
+
+    async def on_qr_ttl_preset(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        try:
+            minutes = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный срок", show_alert=True)
+            return
+        if minutes not in {30, 120, 360, 1440, 4320, 10080}:
+            await callback.answer("Некорректный срок", show_alert=True)
+            return
+        await state.update_data(expires_at=time.time() + minutes * 60)
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._finish_qr_creation(message, state, callback.from_user.id)
+        await callback.answer()
+
+    async def on_qr_ttl_unit(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        unit = callback.data.rsplit(":", 1)[1]
+        prompts = {
+            "months": ("ttl_months", "📆 Введите количество месяцев (1 месяц = 30 дней):"),
+            "days": ("ttl_days", "📅 Введите количество дней:"),
+            "hours": ("ttl_hours", "🕐 Введите количество часов:"),
+            "minutes": ("ttl_minutes", "⏱ Введите количество минут:"),
+        }
+        if unit not in prompts:
+            await callback.answer("Некорректная единица", show_alert=True)
+            return
+        field, prompt = prompts[unit]
+        await state.update_data(ttl_unit=field)
+        await state.set_state(QRStates.ttl_value)
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._edit_message(message, prompt, self._cancel_keyboard("qr_ttl_back"))
+        await callback.answer()
+
+    async def on_qr_ttl_back(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        await state.set_state(QRStates.ttl)
+        data = await state.get_data()
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._edit_message(message, self._qr_ttl_text(data), self._qr_ttl_keyboard())
+        await callback.answer()
+
+    async def on_qr_ttl_value(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_message(message):
+            return
+        try:
+            value = int((message.text or "").strip())
+        except ValueError:
+            value = -1
+        if value < 0:
+            await message.answer("Введите ноль или положительное целое число.")
+            return
+        data = await state.get_data()
+        field = str(data.get("ttl_unit", ""))
+        if field not in {"ttl_months", "ttl_days", "ttl_hours", "ttl_minutes"}:
+            await state.set_state(QRStates.ttl)
+            await message.answer(self._qr_ttl_text(data), reply_markup=self._qr_ttl_keyboard())
+            return
+        candidate = dict(data)
+        candidate[field] = value
+        if self._qr_total_minutes(candidate) > MAX_QR_TTL_MINUTES:
+            await message.answer("Общий срок не может превышать 365 дней.")
+            return
+        await state.update_data(**{field: value})
+        await state.set_state(QRStates.ttl)
+        await message.answer(
+            self._qr_ttl_text(await state.get_data()),
+            reply_markup=self._qr_ttl_keyboard(),
+        )
+
+    async def on_qr_ttl_reset(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        await state.update_data(ttl_months=0, ttl_days=0, ttl_hours=0, ttl_minutes=0)
+        message = self._callback_message(callback)
+        if message is not None:
+            data = await state.get_data()
+            await self._edit_message(message, self._qr_ttl_text(data), self._qr_ttl_keyboard())
+        await callback.answer("Срок сброшен")
+
+    async def on_qr_ttl_finish(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback):
+            return
+        data = await state.get_data()
+        total = self._qr_total_minutes(data)
+        if total <= 0:
+            await callback.answer("Сначала настройте срок действия", show_alert=True)
+            return
+        if total > MAX_QR_TTL_MINUTES:
+            await callback.answer("Срок не может превышать 365 дней", show_alert=True)
+            return
+        await state.update_data(expires_at=time.time() + total * 60)
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._finish_qr_creation(message, state, callback.from_user.id)
+        await callback.answer()
 
     async def on_qr_ttl(self, message: Message, state: FSMContext) -> None:
         if not await self._require_message(message):
@@ -528,15 +908,19 @@ class DoorBot:
             minutes = int((message.text or "").strip())
         except ValueError:
             minutes = 0
-        if not 1 <= minutes <= 10080:
-            await message.answer("Введите целое число минут от 1 до 10080.")
+        if not 1 <= minutes <= MAX_QR_TTL_MINUTES:
+            await message.answer("Введите положительное число минут не более 365 дней.")
             return
         await state.update_data(expires_at=time.time() + minutes * 60)
         await self._finish_qr_creation(message, state)
 
-    async def _finish_qr_creation(self, message: Message, state: FSMContext) -> None:
-        if message.from_user is None:
-            return
+    async def _finish_qr_creation(
+        self, message: Message, state: FSMContext, user_id: int | None = None
+    ) -> None:
+        if user_id is None:
+            if message.from_user is None:
+                return
+            user_id = message.from_user.id
         data = await state.get_data()
         kind = str(data.get("kind", ""))
         name = str(data.get("name", ""))
@@ -545,7 +929,7 @@ class DoorBot:
             await message.answer("Данные мастера устарели. Начните создание QR заново.")
             return
         qr_id, token = await self._create_unique_qr(
-            creator_id=message.from_user.id,
+            creator_id=user_id,
             label=name,
             qr_type=kind,
             max_uses=int(data["max_uses"]),
@@ -558,19 +942,31 @@ class DoorBot:
         qr = await self.db.get_qr_token(token)
         if qr is None or int(qr["id"]) != qr_id:
             raise RuntimeError("Созданный QR не найден")
-        link = build_deep_link(self.settings.bot_username, token)
-        uses = "безлимит" if int(qr["max_uses"]) == 0 else str(qr["max_uses"])
+        link = build_deep_link(self.bot_username, token)
+        max_uses = int(qr["max_uses"])
+        limit = "∞" if max_uses == 0 else str(max_uses)
         expires = (
             time.strftime("%d.%m.%Y %H:%M", time.localtime(float(qr["expires_at"])))
             if qr["expires_at"] is not None
-            else "бессрочный"
+            else "без ограничения"
         )
+        reason = self._qr_rejection_reason(qr)
+        status = "🟢 Активен" if reason is None else f"⚪ {QR_REASON_MESSAGES[reason]}"
+        qr_type = QR_TYPE_NAMES.get(str(qr["qr_type"]), str(qr["qr_type"]))
         caption = (
-            f"🎟 {qr['label']}\nТип: {qr['qr_type']}\n"
-            f"Использований: {uses}\nСрок: {expires}\n\nСсылка у двери: {link}"
+            f"🎟 {qr['label']}\n\n"
+            f"Тип: {qr_type}\n"
+            f"Статус: {status}\n"
+            f"Использовано: {qr['used_count']} / {limit}\n"
+            f"Действует до: {expires}\n\n"
+            f"🔗 Открытие у двери:\n{link}"
         )
         builder = InlineKeyboardBuilder()
-        builder.button(text="🚫 Отозвать", callback_data=f"qr_revoke:{qr_id}")
+        if reason is None:
+            builder.button(text="🚫 Отозвать пропуск", callback_data=f"qr_revoke:{qr_id}")
+        builder.button(text="⬅️ К пропускам", callback_data="nav:qr")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
         await message.answer_photo(
             BufferedInputFile(render_qr_png(token), filename=f"door_{token}.png"),
             caption=caption,
@@ -599,7 +995,10 @@ class DoorBot:
             await callback.answer("QR не найден", show_alert=True)
             return
         await self.db.set_qr_token_active(int(qr["id"]), False, callback.from_user.id)
-        await callback.answer("QR отозван")
+        await callback.answer("Пропуск отозван")
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_qr_menu(message, callback.from_user.id, edit=True)
 
     async def _find_user_qr(
         self, user_id: int, callback_data: str, prefix: str
@@ -614,22 +1013,29 @@ class DoorBot:
     async def on_face_menu(self, message: Message) -> None:
         if not await self._require_message(message) or message.from_user is None:
             return
-        faces = await self.db.list_face_embeddings(message.from_user.id)
+        await self._send_face_menu(message, message.from_user.id)
+
+    async def _send_face_menu(self, message: Message, user_id: int, edit: bool = False) -> None:
+        faces = await self.db.list_face_embeddings(user_id)
         builder = InlineKeyboardBuilder()
         for face in faces[:20]:
-            status = "✅" if face["is_active"] else "🚫"
+            status = "🟢" if face["is_active"] else "⚪"
             builder.button(
-                text=f"{status} {face['person_name']}",
+                text=f"{status} {str(face['person_name'])[:45]}",
                 callback_data=f"face_toggle:{face['id']}",
             )
         builder.button(text="➕ Добавить лицо", callback_data="face_add")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
-        await message.answer(
-            "Нажмите на лицо, чтобы включить или отключить его."
+        text = (
+            "👥 Лица\n\nНажмите на имя, чтобы включить или отключить распознавание."
             if faces
-            else "У вас пока нет зарегистрированных лиц.",
-            reply_markup=builder.as_markup(),
+            else "👥 Лица\n\nДобавьте фотографию человека, которому разрешено открывать дверь."
         )
+        if edit:
+            await self._edit_message(message, text, builder.as_markup())
+        else:
+            await message.answer(text, reply_markup=builder.as_markup())
 
     async def on_face_add(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback):
@@ -638,7 +1044,11 @@ class DoorBot:
         await state.set_state(FaceStates.name)
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer("Введите имя человека (1–64 символа):", reply_markup=self._cancel_keyboard())
+            await self._edit_message(
+                message,
+                "👥 Новое лицо\n\nВведите имя человека:",
+                self._cancel_keyboard("nav:faces"),
+            )
         await callback.answer()
 
     async def on_face_name(self, message: Message, state: FSMContext) -> None:
@@ -651,8 +1061,8 @@ class DoorBot:
         await state.update_data(name=name)
         await state.set_state(FaceStates.photo)
         await message.answer(
-            "Отправьте одну четкую фотографию лица. На ней должен быть только один человек.",
-            reply_markup=self._cancel_keyboard(),
+            f"👤 {name}\n\nОтправьте четкую фотографию. На снимке должно быть только одно лицо.",
+            reply_markup=self._cancel_keyboard("nav:faces"),
         )
 
     async def on_face_photo(self, message: Message, state: FSMContext) -> None:
@@ -672,7 +1082,14 @@ class DoorBot:
             path.unlink(missing_ok=True)
             raise
         await state.clear()
-        await message.answer(f"Фотография принята. Задача регистрации №{task_id} передана воркеру.")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ К списку лиц", callback_data="nav:faces")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
+        await message.answer(
+            f"✅ Фотография «{name}» принята.\n\nРезультат распознавания придет отдельным сообщением.",
+            reply_markup=builder.as_markup(),
+        )
 
     async def on_face_photo_invalid(self, message: Message) -> None:
         if await self._require_message(message):
@@ -694,18 +1111,30 @@ class DoorBot:
         active = not bool(face["is_active"])
         await self.db.set_face_embedding_active(face_id, callback.from_user.id, active)
         await self.db.enqueue_ipc_command("reload_faces", "{}")
-        await callback.answer("Лицо включено" if active else "Лицо отключено")
+        await callback.answer("Распознавание включено" if active else "Распознавание отключено")
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_face_menu(message, callback.from_user.id, edit=True)
 
     async def on_admin_menu(self, message: Message) -> None:
         if not await self._require_message(message, admin=True):
             return
+        await self._send_admin_menu(message)
+
+    async def _send_admin_menu(self, message: Message, edit: bool = False) -> None:
         builder = InlineKeyboardBuilder()
-        builder.button(text="➕ Добавить/разблокировать", callback_data="admin_add")
-        builder.button(text="🚫 Заблокировать", callback_data="admin_block")
-        builder.button(text="📜 Последние 10 входов", callback_data="admin_logs")
-        builder.button(text="🎟 Все QR", callback_data="admin_qrs")
+        builder.button(text="👥 Пользователи и сроки", callback_data="admin_users")
+        builder.button(text="➕ Добавить пользователя", callback_data="admin_add")
+        builder.button(text="🚫 Заблокировать пользователя", callback_data="admin_block")
+        builder.button(text="📜 Журнал входов", callback_data="admin_logs")
+        builder.button(text="🎟 Активные пропуска", callback_data="admin_qrs")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
-        await message.answer("Админ-панель", reply_markup=builder.as_markup())
+        text = "🛡 Админ-панель\n\nУправление пользователями, пропусками и журналом."
+        if edit:
+            await self._edit_message(message, text, builder.as_markup())
+        else:
+            await message.answer(text, reply_markup=builder.as_markup())
 
     async def on_admin_add(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback, admin=True):
@@ -714,7 +1143,11 @@ class DoorBot:
         await state.set_state(AdminStates.add_user)
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer("Введите Telegram ID пользователя:", reply_markup=self._cancel_keyboard())
+            await self._edit_message(
+                message,
+                "👤 Новый пользователь\n\nОтправьте его Telegram ID:",
+                self._cancel_keyboard("nav:admin"),
+            )
         await callback.answer()
 
     async def on_admin_add_id(self, message: Message, state: FSMContext) -> None:
@@ -735,7 +1168,8 @@ class DoorBot:
         if existing is not None and existing["role"] == "blocked":
             await self.db.set_user_role(telegram_id, "resident")
         await state.clear()
-        await message.answer(f"Пользователь {telegram_id} добавлен или разблокирован как resident.")
+        await message.answer(f"✅ Пользователь {telegram_id} добавлен или разблокирован.")
+        await self._send_admin_menu(message)
 
     async def on_admin_block(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback, admin=True):
@@ -744,7 +1178,11 @@ class DoorBot:
         await state.set_state(AdminStates.block_user)
         message = self._callback_message(callback)
         if message is not None:
-            await message.answer("Введите Telegram ID для блокировки:", reply_markup=self._cancel_keyboard())
+            await self._edit_message(
+                message,
+                "🚫 Блокировка\n\nОтправьте Telegram ID пользователя:",
+                self._cancel_keyboard("nav:admin"),
+            )
         await callback.answer()
 
     async def on_admin_block_id(self, message: Message, state: FSMContext) -> None:
@@ -783,8 +1221,113 @@ class DoorBot:
         await self.db.enqueue_ipc_command("reload_faces", "{}")
         await state.clear()
         await message.answer(
-            f"Пользователь {telegram_id} заблокирован; его лица, QR и курьерские сессии отключены."
+            f"🚫 Пользователь {telegram_id} заблокирован.\nЕго лица, пропуска и курьерские сессии отключены."
         )
+        await self._send_admin_menu(message)
+
+    def _available_user_qrs(self, tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [qr for qr in tokens if self._qr_rejection_reason(qr) is None]
+
+    @staticmethod
+    def _user_expiry_label(tokens: list[dict[str, Any]]) -> str:
+        expirations = [
+            float(qr["expires_at"])
+            for qr in tokens
+            if qr["expires_at"] is not None
+        ]
+        if expirations:
+            return time.strftime("%d.%m %H:%M", time.localtime(min(expirations)))
+        if tokens:
+            return "бессрочно"
+        return "нет пропусков"
+
+    async def on_admin_users(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        message = self._callback_message(callback)
+        if message is None:
+            await callback.answer("Сообщение недоступно", show_alert=True)
+            return
+        users = await self.db.list_users(100)
+        builder = InlineKeyboardBuilder()
+        for user in users[:20]:
+            tokens = self._available_user_qrs(
+                await self.db.list_qr_tokens(int(user["telegram_id"]))
+            )
+            role_icon = {"admin": "🛡", "resident": "👤", "blocked": "⛔"}.get(
+                str(user["role"]), "👤"
+            )
+            expiry = self._user_expiry_label(tokens)
+            builder.button(
+                text=f"{role_icon} {str(user['full_name'])[:24]} · {expiry}",
+                callback_data=f"user_view:{user['telegram_id']}",
+            )
+        builder.button(text="⬅️ В админ-панель", callback_data="nav:admin")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
+        await self._edit_message(
+            message,
+            "👥 Пользователи\n\nВыберите пользователя. В списке указан ближайший срок активного пропуска.",
+            builder.as_markup(),
+        )
+        await callback.answer()
+
+    async def on_user_view(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        user = await self.db.get_user(user_id)
+        if user is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        message = self._callback_message(callback)
+        if message is None:
+            await callback.answer("Сообщение недоступно", show_alert=True)
+            return
+        tokens = self._available_user_qrs(await self.db.list_qr_tokens(user_id))
+        faces = await self.db.list_face_embeddings(user_id)
+        active_faces = sum(1 for face in faces if face["is_active"])
+        role_names = {"admin": "Администратор", "resident": "Постоялец", "blocked": "Заблокирован"}
+        username = f"@{user['username']}" if user["username"] else "не указан"
+        created = time.strftime("%d.%m.%Y", time.localtime(float(user["created_at"])))
+        qr_lines = []
+        for qr in tokens[:5]:
+            if qr["expires_at"] is None:
+                qr_lines.append(f"♾️ {qr['label']} — без срока")
+            else:
+                expires = time.strftime(
+                    "%d.%m.%Y %H:%M", time.localtime(float(qr["expires_at"]))
+                )
+                qr_lines.append(f"⏳ {qr['label']} — до {expires}")
+        if len(tokens) > 5:
+            qr_lines.append(f"… и еще {len(tokens) - 5}")
+        courier = await self.db.get_active_courier_session(user_id)
+        courier_text = "нет"
+        if courier is not None:
+            courier_text = time.strftime(
+                "%d.%m.%Y %H:%M", time.localtime(float(courier["expires_at"]))
+            )
+        text = (
+            f"👤 {user['full_name']}\n\n"
+            f"ID: {user_id}\nUsername: {username}\n"
+            f"Роль: {role_names.get(str(user['role']), user['role'])}\n"
+            f"Добавлен: {created}\n"
+            f"Лица: {active_faces} активных из {len(faces)}\n"
+            f"Курьерский режим до: {courier_text}\n\n"
+            f"🎟 Действующие пропуска: {len(tokens)}\n"
+            + ("\n".join(qr_lines) if qr_lines else "Нет действующих пропусков.")
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ К пользователям", callback_data="admin_users")
+        builder.button(text="🛡 Админ-панель", callback_data="nav:admin")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
+        await self._edit_message(message, text, builder.as_markup())
+        await callback.answer()
 
     @staticmethod
     def _parse_telegram_id(value: str) -> int | None:
@@ -802,23 +1345,29 @@ class DoorBot:
             await callback.answer("Сообщение недоступно", show_alert=True)
             return
         logs = await self.db.get_recent_access_logs(10)
+        keyboard = InlineKeyboardBuilder()
         if not logs:
-            await message.answer("Журнал входов пуст.")
+            keyboard.button(text="⬅️ В админ-панель", callback_data="nav:admin")
+            await message.answer("📜 Журнал входов\n\nЗаписей пока нет.", reply_markup=keyboard.as_markup())
             await callback.answer()
             return
         lines = []
-        keyboard = InlineKeyboardBuilder()
         for log in logs:
             created = time.strftime("%d.%m %H:%M:%S", time.localtime(float(log["created_at"])))
-            warning = " ⚠️" if log["tailgating_alert"] else ""
+            warning = "\n⚠️ Возможен проход следом" if log["tailgating_alert"] else ""
             lines.append(
-                f"#{log['id']} {created} — {log['method']}, user={log['user_id']}, "
-                f"people={log['people_entered']}{warning}\n{log['details'] or ''}"
+                f"#{log['id']} · {created}\n{log['details'] or log['method']}\n"
+                f"Метод: {log['method']} · Людей: {log['people_entered']}{warning}"
             )
             if log["video_path"]:
-                keyboard.button(text=f"Видео #{log['id']}", callback_data=f"log_video:{log['id']}")
+                keyboard.button(text=f"📹 Видео #{log['id']}", callback_data=f"log_video:{log['id']}")
+        keyboard.button(text="⬅️ В админ-панель", callback_data="nav:admin")
+        keyboard.button(text="🏠 Главное меню", callback_data="nav:main")
         keyboard.adjust(2)
-        await message.answer("\n\n".join(lines), reply_markup=keyboard.as_markup())
+        await message.answer(
+            "📜 Последние входы\n\n" + "\n\n".join(lines),
+            reply_markup=keyboard.as_markup(),
+        )
         await callback.answer()
 
     async def on_log_video(self, callback: CallbackQuery) -> None:
@@ -854,26 +1403,29 @@ class DoorBot:
         if message is None:
             await callback.answer("Сообщение недоступно", show_alert=True)
             return
+        await self._close_expired_courier_qrs()
         tokens = await self.db.list_qr_tokens()
         builder = InlineKeyboardBuilder()
         active_count = 0
         for qr in tokens:
-            if not qr["is_active"]:
+            if self._qr_rejection_reason(qr) is not None:
                 continue
             active_count += 1
             builder.button(
-                text=f"🚫 #{qr['id']} {qr['label']} ({qr['creator_id']})",
+                text=f"🎟 #{qr['id']} · {str(qr['label'])[:30]} · {qr['creator_id']}",
                 callback_data=f"admin_qr_revoke:{qr['id']}",
             )
             if active_count >= 20:
                 break
-        if active_count == 0:
-            await message.answer("Активных QR-кодов нет.")
-        else:
-            builder.adjust(1)
-            await message.answer(
-                "Нажмите на QR, чтобы отозвать его:", reply_markup=builder.as_markup()
-            )
+        builder.button(text="⬅️ В админ-панель", callback_data="nav:admin")
+        builder.button(text="🏠 Главное меню", callback_data="nav:main")
+        builder.adjust(1)
+        text = (
+            "🎟 Активные пропуска\n\nНажмите на пропуск, чтобы отозвать его."
+            if active_count
+            else "🎟 Активные пропуска\n\nСейчас активных пропусков нет."
+        )
+        await message.answer(text, reply_markup=builder.as_markup())
         await callback.answer()
 
     async def on_admin_qr_revoke(self, callback: CallbackQuery) -> None:
@@ -885,14 +1437,14 @@ class DoorBot:
             await callback.answer("Некорректный ID QR", show_alert=True)
             return
         changed = await self.db.set_qr_token_active(qr_id, False)
-        await callback.answer("QR отозван" if changed else "QR не найден", show_alert=not changed)
+        await callback.answer("Пропуск отозван" if changed else "Пропуск не найден", show_alert=not changed)
 
     async def on_fallback(self, message: Message) -> None:
         if not await self._require_message(message) or message.from_user is None:
             return
         role = await self._get_role(message.from_user.id)
         if role in {"admin", "resident"}:
-            await message.answer("Используйте кнопки меню.", reply_markup=self._main_keyboard(role))
+            await message.answer(HOME_TEXT, reply_markup=self._main_keyboard(role))
 
     async def _send_outbox_item(self, item: dict[str, Any]) -> None:
         keyboard: InlineKeyboardMarkup | None = None
@@ -919,10 +1471,14 @@ class DoorBot:
             raise ValueError(f"Неизвестный тип outbox: {media_type}")
 
     async def outbox_dispatcher(self) -> None:
+        last_courier_cleanup = 0.0
         while True:
             try:
-                items = await self.db.get_pending_outbox(20)
                 now = time.monotonic()
+                if now - last_courier_cleanup >= 30.0:
+                    await self._close_expired_courier_qrs()
+                    last_courier_cleanup = now
+                items = await self.db.get_pending_outbox(20)
                 for item in items:
                     outbox_id = int(item["id"])
                     if now < self._retry_after.get(outbox_id, 0.0):
@@ -989,7 +1545,18 @@ class DoorBot:
 
     async def run(self) -> None:
         await self.db.init()
+        await self._close_expired_courier_qrs()
         await self._initialize_admins()
+        telegram_user = await self.bot.get_me()
+        if telegram_user.username:
+            self.bot_username = telegram_user.username
+        await self.bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Начать работу"),
+                BotCommand(command="menu", description="Главное меню"),
+                BotCommand(command="cancel", description="Отменить текущее действие"),
+            ]
+        )
         dispatcher = Dispatcher(storage=MemoryStorage())
         dispatcher.include_router(self.router)
         outbox_task = asyncio.create_task(self.outbox_dispatcher(), name="outbox-dispatcher")
