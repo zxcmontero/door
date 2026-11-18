@@ -37,6 +37,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from config import Settings, get_settings
 from database import Database
 from qr_generator import build_deep_link, build_http_link, generate_token, render_qr_png
+from version import __version__
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,8 @@ BUTTON_ADMIN = "🛡 Админ-панель"
 HOME_TEXT = (
     "🏠 Домофон\n\n"
     "Управление дверью, камерой и доступом.\n"
-    "Выберите действие на клавиатуре ниже."
+    "Выберите действие на клавиатуре ниже.\n\n"
+    f"Версия: {__version__}"
 )
 MAX_QR_TTL_MINUTES = 365 * 1440
 QR_TYPE_NAMES = {
@@ -110,6 +112,7 @@ class DoorBot:
         router.message.register(self.on_start, CommandStart())
         router.message.register(self.on_cancel, Command("cancel"))
         router.message.register(self.on_menu, Command("menu"))
+        router.message.register(self.on_version, Command("version"))
         router.callback_query.register(self.on_fsm_cancel, F.data == "fsm_cancel")
         router.callback_query.register(self.on_nav_main, F.data == "nav:main")
         router.callback_query.register(self.on_nav_qr, F.data == "nav:qr")
@@ -291,6 +294,11 @@ class DoorBot:
         role = await self._get_role(message.from_user.id)
         if role in {"admin", "resident"}:
             await self._send_home(message, role)
+
+    async def on_version(self, message: Message) -> None:
+        if not await self._require_message(message):
+            return
+        await message.answer(f"ℹ️ Версия системы: {__version__}")
 
     async def on_cancel(self, message: Message, state: FSMContext) -> None:
         await state.clear()
@@ -1933,6 +1941,7 @@ class DoorBot:
         )
 
     async def run(self) -> None:
+        logger.info("Запуск Telegram-бота, версия %s", __version__)
         outbox_task: asyncio.Task[None] | None = None
         try:
             await self.db.init()
@@ -1946,6 +1955,7 @@ class DoorBot:
                     BotCommand(command="start", description="Начать работу"),
                     BotCommand(command="menu", description="Главное меню"),
                     BotCommand(command="cancel", description="Отменить текущее действие"),
+                    BotCommand(command="version", description="Версия системы"),
                 ]
             )
             dispatcher = Dispatcher(storage=MemoryStorage())

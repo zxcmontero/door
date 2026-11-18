@@ -22,6 +22,7 @@ from config import Settings, get_settings
 from dahua_client import DahuaClient, DahuaEvent
 from database import SyncDatabase
 from qr_generator import extract_token
+from version import __version__
 
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,7 @@ class CVWorker:
         await asyncio.to_thread(self.face_engine.initialize)
         await self.reload_faces()
         self.capture.start()
-        logger.info("CV worker запущен")
+        logger.info("CV worker запущен, версия %s", __version__)
         try:
             async with asyncio.TaskGroup() as task_group:
                 task_group.create_task(self._analysis_loop())
