@@ -5,7 +5,7 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from dotenv import load_dotenv
 
@@ -104,6 +104,9 @@ class Settings:
     face_cooldown_seconds: float
     door_unlock_cooldown_seconds: float
     courier_face_ttl_seconds: int
+    public_base_url: str
+    http_host: str
+    http_port: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,6 +118,22 @@ class Settings:
         similarity = _positive_float("FACE_SIMILARITY_THRESHOLD", 0.48)
         if similarity > 1.0:
             raise ConfigError("FACE_SIMILARITY_THRESHOLD не может быть больше 1.0")
+        public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+        if public_base_url:
+            parsed_url = urlsplit(public_base_url)
+            if (
+                parsed_url.scheme not in {"http", "https"}
+                or not parsed_url.netloc
+                or parsed_url.username is not None
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                raise ConfigError(
+                    "PUBLIC_BASE_URL должен быть HTTP(S) URL без учетных данных, query и fragment"
+                )
+        http_host = os.getenv("HTTP_HOST", "0.0.0.0").strip()
+        if not http_host:
+            raise ConfigError("HTTP_HOST не может быть пустым")
         return cls(
             bot_token=_required("BOT_TOKEN"),
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@"),
@@ -137,6 +156,9 @@ class Settings:
             face_cooldown_seconds=_positive_float("FACE_COOLDOWN_SECONDS", 20.0),
             door_unlock_cooldown_seconds=_positive_float("DOOR_UNLOCK_COOLDOWN_SECONDS", 8.0),
             courier_face_ttl_seconds=_positive_integer("COURIER_FACE_TTL_SECONDS", 600),
+            public_base_url=public_base_url,
+            http_host=http_host,
+            http_port=_positive_integer("HTTP_PORT", 8080),
         )
 
     @property

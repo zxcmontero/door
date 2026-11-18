@@ -21,6 +21,7 @@ from insightface.app import FaceAnalysis
 from config import Settings, get_settings
 from dahua_client import DahuaClient, DahuaEvent
 from database import SyncDatabase
+from qr_generator import extract_token
 
 
 logger = logging.getLogger(__name__)
@@ -476,8 +477,9 @@ class CVWorker:
             if not code.text or now - self._last_seen_codes.get(code.text, 0.0) < 3.0:
                 continue
             self._last_seen_codes[code.text] = now
-            if code.text.startswith("DOOR:"):
-                await self._process_door_qr(code.text[5:].strip())
+            token = extract_token(code.text)
+            if token is not None:
+                await self._process_door_qr(token)
                 continue
             if code.format not in {"CODE128", "EAN13", "DATAMATRIX", "QRCODE"}:
                 continue

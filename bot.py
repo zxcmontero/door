@@ -8,9 +8,11 @@ import re
 import sqlite3
 import time
 import uuid
+from html import escape
 from pathlib import Path
 from typing import Any
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import (
     TelegramBadRequest,
@@ -34,7 +36,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from config import Settings, get_settings
 from database import Database
-from qr_generator import build_deep_link, generate_token, render_qr_png
+from qr_generator import build_deep_link, build_http_link, generate_token, render_qr_png
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,7 @@ QR_TYPE_NAMES = {
 ACCESS_METHOD_NAMES = {
     "face": "👤 Распознавание лица",
     "qr_camera": "🎟 QR перед камерой",
-    "qr_deeplink": "🔗 QR через Telegram",
+    "qr_deeplink": "🔗 QR по ссылке",
     "button": "🔘 Кнопка в Telegram",
     "courier_auto": "📦 Автоматический вход курьера",
     "courier_barcode": "📊 Штрихкод доставки",
@@ -87,6 +89,7 @@ class FaceStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     add_user = State()
+    add_role = State()
     block_user = State()
 
 
@@ -99,6 +102,7 @@ class DoorBot:
         self.router = Router()
         self._retry_after: dict[int, float] = {}
         self._retry_attempts: dict[int, int] = {}
+        self._http_runner: web.AppRunner | None = None
         self._register_handlers()
 
     def _register_handlers(self) -> None:
@@ -133,11 +137,18 @@ class DoorBot:
         router.callback_query.register(self.on_face_toggle, F.data.startswith("face_toggle:"))
 
         router.callback_query.register(self.on_admin_add, F.data == "admin_add")
+        router.callback_query.register(self.on_admin_add_role, F.data.startswith("admin_add_role:"), AdminStates.add_role)
         router.callback_query.register(self.on_admin_block, F.data == "admin_block")
         router.callback_query.register(self.on_admin_logs, F.data == "admin_logs")
         router.callback_query.register(self.on_admin_qrs, F.data == "admin_qrs")
         router.callback_query.register(self.on_admin_users, F.data == "admin_users")
         router.callback_query.register(self.on_user_view, F.data.startswith("user_view:"))
+        router.callback_query.register(self.on_admin_user_role, F.data.startswith("admin_user_role:"))
+        router.callback_query.register(self.on_admin_user_block, F.data.startswith("admin_user_block:"))
+        router.callback_query.register(self.on_admin_user_restore, F.data.startswith("admin_user_restore:"))
+        router.callback_query.register(self.on_admin_faces, F.data.startswith("admin_faces:"))
+        router.callback_query.register(self.on_admin_face_add, F.data.startswith("admin_face_add:"))
+        router.callback_query.register(self.on_admin_face_toggle, F.data.startswith("admin_face_toggle:"))
         router.callback_query.register(self.on_admin_qr_revoke, F.data.startswith("admin_qr_revoke:"))
         router.callback_query.register(self.on_log_video, F.data.startswith("log_video:"))
 
@@ -196,10 +207,14 @@ class DoorBot:
         return callback.message if isinstance(callback.message, Message) else None
 
     async def _edit_message(
-        self, message: Message, text: str, reply_markup: InlineKeyboardMarkup
+        self,
+        message: Message,
+        text: str,
+        reply_markup: InlineKeyboardMarkup,
+        **kwargs: Any,
     ) -> None:
         try:
-            await message.edit_text(text, reply_markup=reply_markup)
+            await message.edit_text(text, reply_markup=reply_markup, **kwargs)
         except TelegramBadRequest as exc:
             if "message is not modified" in str(exc).lower():
                 return
@@ -207,7 +222,7 @@ class DoorBot:
                 await message.delete()
             except TelegramBadRequest as delete_error:
                 logger.debug("Не удалось удалить старое сообщение меню: %s", delete_error)
-            await message.answer(text, reply_markup=reply_markup)
+            await message.answer(text, reply_markup=reply_markup, **kwargs)
 
     @staticmethod
     def _main_keyboard(role: str) -> Any:
@@ -476,7 +491,7 @@ class DoorBot:
         return None
 
     async def _send_courier_pass(self, message: Message, token: str, minutes: int) -> None:
-        link = build_deep_link(self.bot_username, token, "cour")
+        link = self._access_link(token, "cour")
         comment = (
             "Домофон откроется сам при нажатии кнопки вызова на панели, "
             f"либо нажмите у двери: {link}"
@@ -486,7 +501,10 @@ class DoorBot:
         builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
         await message.answer_photo(
-            BufferedInputFile(render_qr_png(token), filename=f"courier_{token}.png"),
+            BufferedInputFile(
+                render_qr_png(token, self._qr_payload(token, "cour")),
+                filename=f"courier_{token}.png",
+            ),
             caption=f"📦 Курьерский пропуск\n\nОсталось около {minutes} мин.",
             reply_markup=builder.as_markup(),
         )
@@ -518,31 +536,43 @@ class DoorBot:
         await self._send_courier_pass(message, token, max(1, remaining_seconds // 60))
         await callback.answer("QR и текст отправлены")
 
-    async def _handle_deep_link(
-        self, message: Message, token: str, kind: str, initiator_id: int
-    ) -> None:
-        if await self._get_role(initiator_id) == "blocked":
-            await message.answer("⛔ Доступ запрещен.")
-            return
+    def _access_link(self, token: str, kind: str = "qr") -> str:
+        if self.settings.public_base_url:
+            return build_http_link(self.settings.public_base_url, token, kind)
+        return build_deep_link(self.bot_username, token, kind)
+
+    def _qr_payload(self, token: str, kind: str = "qr") -> str | None:
+        if self.settings.public_base_url:
+            return build_http_link(self.settings.public_base_url, token, kind)
+        return None
+
+    async def _request_deep_link_unlock(
+        self,
+        token: str,
+        kind: str,
+        initiator_id: int | None,
+        chat_id: int | None,
+    ) -> tuple[int, str, bool]:
+        if initiator_id is not None and await self._get_role(initiator_id) == "blocked":
+            return 403, "⛔ Доступ запрещен.", False
         if not TOKEN_PATTERN.fullmatch(token) or kind not in {"qr", "cour"}:
-            await message.answer("Некорректная ссылка доступа.")
-            return
+            return 400, "Некорректная ссылка доступа.", False
         qr = await self.db.get_qr_token(token)
         reason = self._qr_rejection_reason(qr)
         if reason is not None:
-            await message.answer(f"⚠️ {QR_REASON_MESSAGES[reason]}.")
-            return
+            status = 404 if reason == "not_found" else 410
+            return status, f"⚠️ {QR_REASON_MESSAGES[reason]}.", False
         if qr is None:
-            return
+            return 404, "⚠️ QR-код не найден.", False
+        if kind == "cour" and qr["qr_type"] != "courier":
+            return 400, "⚠️ Эта ссылка не является курьерской.", False
+        if kind == "qr" and qr["qr_type"] == "courier":
+            return 400, "⚠️ Для курьерского пропуска используйте курьерскую ссылку.", False
         courier_session: dict[str, Any] | None = None
         if kind == "cour":
-            if qr["qr_type"] != "courier":
-                await message.answer("⚠️ Эта ссылка не является курьерской.")
-                return
             courier_session = await self.db.get_active_courier_session(int(qr["creator_id"]))
             if courier_session is None:
-                await message.answer("⚠️ Ожидание курьера уже завершено.")
-                return
+                return 410, "⚠️ Ожидание курьера уже завершено.", False
         state = await self.db.get_door_state()
         now = time.time()
         present = (
@@ -550,26 +580,14 @@ class DoorBot:
             or now - float(state["last_motion_ts"]) <= 4.0
         )
         if not present:
-            builder = InlineKeyboardBuilder()
-            builder.button(
-                text="🔄 Я у камеры, повторить",
-                callback_data=f"deeplink_retry:{kind}:{token}",
-            )
-            await message.answer(
-                "⚠️ Подойдите вплотную к камере домофона и нажмите кнопку ниже",
-                reply_markup=builder.as_markup(),
-            )
-            return
+            return 409, "⚠️ Подойдите вплотную к камере домофона и повторите попытку.", True
         consumed = await self.db.consume_qr_token(token)
         if not consumed.allowed or consumed.token is None:
-            await message.answer(
-                f"⚠️ {QR_REASON_MESSAGES.get(consumed.reason, 'QR-код недействителен')}."
-            )
-            return
+            return 410, f"⚠️ {QR_REASON_MESSAGES.get(consumed.reason, 'QR-код недействителен')}.", False
         qr = consumed.token
         payload: dict[str, Any] = {
             "user_id": int(qr["creator_id"]),
-            "chat_id": message.chat.id,
+            "chat_id": chat_id if chat_id is not None else int(qr["creator_id"]),
             "method": "qr_deeplink",
             "details": f"QR «{qr['label']}», тип {qr['qr_type']}",
             "qr_id": int(qr["id"]),
@@ -584,9 +602,33 @@ class DoorBot:
         except Exception as exc:
             await self.db.refund_qr_use(int(qr["id"]), int(qr["used_count"]))
             logger.exception("Не удалось создать IPC для QR deep link: %s", exc)
-            await message.answer("⚠️ Не удалось передать команду. Использование QR возвращено.")
-            return
-        await message.answer("✅ Проверка пройдена. Команда открытия отправлена.")
+            return 500, "⚠️ Не удалось передать команду. Использование QR возвращено.", False
+        return 202, "✅ Проверка пройдена. Команда открытия отправлена.", False
+
+    async def _handle_deep_link(
+        self, message: Message, token: str, kind: str, initiator_id: int
+    ) -> None:
+        _, text, retry = await self._request_deep_link_unlock(
+            token, kind, initiator_id, message.chat.id
+        )
+        keyboard = None
+        if retry:
+            builder = InlineKeyboardBuilder()
+            builder.button(
+                text="🔄 Я у камеры, повторить",
+                callback_data=f"deeplink_retry:{kind}:{token}",
+            )
+            keyboard = builder.as_markup()
+        await message.answer(text, reply_markup=keyboard)
+
+    async def _http_open(self, request: web.Request) -> web.Response:
+        status, text, _ = await self._request_deep_link_unlock(
+            request.match_info["token"],
+            request.match_info["kind"],
+            None,
+            None,
+        )
+        return web.Response(status=status, text=text, charset="utf-8")
 
     async def on_deeplink_retry(self, callback: CallbackQuery) -> None:
         message = self._callback_message(callback)
@@ -995,7 +1037,7 @@ class DoorBot:
         qr = await self.db.get_qr_token(token)
         if qr is None or int(qr["id"]) != qr_id:
             raise RuntimeError("Созданный QR не найден")
-        link = build_deep_link(self.bot_username, token)
+        link = self._access_link(token)
         max_uses = int(qr["max_uses"])
         limit = "∞" if max_uses == 0 else str(max_uses)
         expires = (
@@ -1021,7 +1063,10 @@ class DoorBot:
         builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
         await message.answer_photo(
-            BufferedInputFile(render_qr_png(token), filename=f"door_{token}.png"),
+            BufferedInputFile(
+                render_qr_png(token, self._qr_payload(token)),
+                filename=f"door_{token}.png",
+            ),
             caption=caption,
             reply_markup=builder.as_markup(),
         )
@@ -1069,6 +1114,7 @@ class DoorBot:
         await self._send_face_menu(message, message.from_user.id)
 
     async def _send_face_menu(self, message: Message, user_id: int, edit: bool = False) -> None:
+        role = await self._get_role(user_id)
         faces = await self.db.list_face_embeddings(user_id)
         builder = InlineKeyboardBuilder()
         for face in faces[:20]:
@@ -1079,7 +1125,8 @@ class DoorBot:
                 text=f"{status} {str(face['person_name'])[:34]} · {action}",
                 callback_data=f"face_toggle:{face['id']}",
             )
-        builder.button(text="➕ Добавить лицо", callback_data="face_add")
+        if role == "admin":
+            builder.button(text="➕ Добавить лицо", callback_data="face_add")
         builder.button(text="🎟 Перейти к пропускам", callback_data="nav:qr")
         builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
@@ -1094,20 +1141,21 @@ class DoorBot:
             if len(faces) > 20:
                 text += "\n\nПоказаны 20 последних записей."
         else:
-            text = (
-                "👥 Лица\n\n"
-                "Добавьте фотографию человека, которому разрешено открывать дверь.\n"
-                "На фотографии должно быть ровно одно хорошо видимое лицо."
-            )
+            text = "👥 Лица\n\nЗарегистрированных лиц пока нет."
+        if role == "admin":
+            text += "\n\nДобавьте фотографию с одним хорошо видимым лицом."
+        else:
+            text += "\n\nНовые лица регистрирует администратор."
         if edit:
             await self._edit_message(message, text, builder.as_markup())
         else:
             await message.answer(text, reply_markup=builder.as_markup())
 
     async def on_face_add(self, callback: CallbackQuery, state: FSMContext) -> None:
-        if not await self._require_callback(callback):
+        if not await self._require_callback(callback, admin=True):
             return
         await state.clear()
+        await state.update_data(target_user_id=callback.from_user.id, back_callback="nav:faces")
         await state.set_state(FaceStates.name)
         message = self._callback_message(callback)
         if message is not None:
@@ -1119,47 +1167,53 @@ class DoorBot:
         await callback.answer()
 
     async def on_face_name(self, message: Message, state: FSMContext) -> None:
-        if not await self._require_message(message):
+        if not await self._require_message(message, admin=True) or message.from_user is None:
             return
+        data = await state.get_data()
         name = (message.text or "").strip()
         if not 1 <= len(name) <= 64:
             await message.answer("Имя должно содержать от 1 до 64 символов.")
             return
         await state.update_data(name=name)
         await state.set_state(FaceStates.photo)
+        back_callback = str(data.get("back_callback", "nav:faces"))
         await message.answer(
             f"👤 {name}\n\nОтправьте четкую фотографию. На снимке должно быть только одно лицо.",
-            reply_markup=self._cancel_keyboard("nav:faces"),
+            reply_markup=self._cancel_keyboard(back_callback),
         )
 
     async def on_face_photo(self, message: Message, state: FSMContext) -> None:
-        if not await self._require_message(message) or message.from_user is None:
+        if not await self._require_message(message, admin=True) or message.from_user is None:
             return
         data = await state.get_data()
         name = str(data.get("name", "")).strip()
-        if not name:
+        target_user_id = int(data.get("target_user_id", message.from_user.id))
+        target_user = await self.db.get_user(target_user_id)
+        if not name or target_user is None or target_user["role"] == "blocked":
             await state.clear()
-            await message.answer("Данные мастера устарели. Начните регистрацию заново.")
+            await message.answer("Данные устарели или пользователь недоступен. Начните заново.")
             return
-        path = self.settings.face_tasks_dir / f"{message.from_user.id}_{uuid.uuid4().hex}.jpg"
+        path = self.settings.face_tasks_dir / f"{target_user_id}_{uuid.uuid4().hex}.jpg"
         try:
             await message.bot.download(message.photo[-1], destination=path)
-            task_id = await self.db.create_face_task(message.from_user.id, name, str(path))
+            await self.db.create_face_task(target_user_id, name, str(path))
         except Exception:
             path.unlink(missing_ok=True)
             raise
         await state.clear()
         builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ К списку лиц", callback_data="nav:faces")
+        back_callback = str(data.get("back_callback", "nav:faces"))
+        builder.button(text="⬅️ К списку лиц", callback_data=back_callback)
         builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
         await message.answer(
-            f"✅ Фотография «{name}» принята.\n\nРезультат распознавания придет отдельным сообщением.",
+            f"✅ Фотография «{name}» принята.\n\n"
+            "Результат появится в списке лиц; пользователь получит отдельное уведомление.",
             reply_markup=builder.as_markup(),
         )
 
     async def on_face_photo_invalid(self, message: Message) -> None:
-        if await self._require_message(message):
+        if await self._require_message(message, admin=True):
             await message.answer("Нужно отправить фотографию, а не текст или другой файл.")
 
     async def on_face_toggle(self, callback: CallbackQuery) -> None:
@@ -1183,6 +1237,116 @@ class DoorBot:
         if message is not None:
             await self._send_face_menu(message, callback.from_user.id, edit=True)
 
+    async def _send_admin_faces(
+        self, message: Message, user_id: int, edit: bool = True
+    ) -> bool:
+        user = await self.db.get_user(user_id)
+        if user is None:
+            return False
+        faces = await self.db.list_face_embeddings(user_id)
+        builder = InlineKeyboardBuilder()
+        for face in faces[:20]:
+            status = "🟢" if face["is_active"] else "⚪"
+            builder.button(
+                text=f"{status} {str(face['person_name'])[:40]}",
+                callback_data=f"admin_face_toggle:{face['id']}:{user_id}",
+            )
+        if user["role"] != "blocked":
+            builder.button(text="➕ Добавить лицо", callback_data=f"admin_face_add:{user_id}")
+        builder.button(text="⬅️ К карточке пользователя", callback_data=f"user_view:{user_id}")
+        builder.button(text="🛡 Админ-панель", callback_data="nav:admin")
+        builder.adjust(1)
+        active_count = sum(bool(face["is_active"]) for face in faces)
+        text = (
+            f"👥 Лица: {user['full_name']}\n\n"
+            f"Всего: {len(faces)} · активных: {active_count}\n"
+            "Нажмите на лицо, чтобы включить или отключить доступ."
+        )
+        if len(faces) > 20:
+            text += "\n\nПоказаны 20 последних записей."
+        if user["role"] == "blocked":
+            text += "\n\nПользователь заблокирован: включить лица нельзя."
+        if edit:
+            await self._edit_message(message, text, builder.as_markup())
+        else:
+            await message.answer(text, reply_markup=builder.as_markup())
+        return True
+
+    async def on_admin_faces(self, callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        message = self._callback_message(callback)
+        if message is None:
+            await callback.answer("Сообщение недоступно", show_alert=True)
+            return
+        if not await self._send_admin_faces(message, user_id):
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        await callback.answer()
+
+    async def on_admin_face_add(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        user = await self.db.get_user(user_id)
+        if user is None or user["role"] == "blocked":
+            await callback.answer("Пользователь не найден или заблокирован", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(
+            target_user_id=user_id,
+            back_callback=f"admin_faces:{user_id}",
+        )
+        await state.set_state(FaceStates.name)
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._edit_message(
+                message,
+                f"👥 Новое лицо: {user['full_name']}\n\nВведите имя человека:",
+                self._cancel_keyboard(f"admin_faces:{user_id}"),
+            )
+        await callback.answer()
+
+    async def on_admin_face_toggle(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            _, raw_face_id, raw_user_id = callback.data.split(":", 2)
+            face_id = int(raw_face_id)
+            user_id = int(raw_user_id)
+        except ValueError:
+            await callback.answer("Некорректные данные лица", show_alert=True)
+            return
+        user = await self.db.get_user(user_id)
+        if user is None:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        faces = await self.db.list_face_embeddings(user_id)
+        face = next((item for item in faces if int(item["id"]) == face_id), None)
+        if face is None:
+            await callback.answer("Лицо не найдено", show_alert=True)
+            return
+        active = not bool(face["is_active"])
+        if active and user["role"] == "blocked":
+            await callback.answer("Сначала разблокируйте пользователя", show_alert=True)
+            return
+        await self.db.set_face_embedding_active(face_id, user_id, active)
+        await self.db.enqueue_ipc_command("reload_faces", "{}")
+        await callback.answer("Распознавание включено" if active else "Распознавание отключено")
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_admin_faces(message, user_id)
+
     async def on_admin_menu(self, message: Message) -> None:
         if not await self._require_message(message, admin=True):
             return
@@ -1190,14 +1354,18 @@ class DoorBot:
 
     async def _send_admin_menu(self, message: Message, edit: bool = False) -> None:
         builder = InlineKeyboardBuilder()
-        builder.button(text="👥 Пользователи и сроки", callback_data="admin_users")
-        builder.button(text="➕ Добавить пользователя", callback_data="admin_add")
-        builder.button(text="🚫 Заблокировать пользователя", callback_data="admin_block")
+        builder.button(text="👥 Пользователи и доступ", callback_data="admin_users")
+        builder.button(text="➕ Добавить пользователя или администратора", callback_data="admin_add")
+        builder.button(text="🚫 Заблокировать по Telegram ID", callback_data="admin_block")
         builder.button(text="📜 Журнал входов", callback_data="admin_logs")
         builder.button(text="🎟 Активные пропуска", callback_data="admin_qrs")
         builder.button(text="🏠 Главное меню", callback_data="nav:main")
         builder.adjust(1)
-        text = "🛡 Админ-панель\n\nУправление пользователями, пропусками и журналом."
+        text = (
+            "🛡 Админ-панель\n\n"
+            "Управление ролями, лицами и пропусками.\n"
+            "Откройте карточку пользователя, чтобы изменить его доступ."
+        )
         if edit:
             await self._edit_message(message, text, builder.as_markup())
         else:
@@ -1212,7 +1380,7 @@ class DoorBot:
         if message is not None:
             await self._edit_message(
                 message,
-                "👤 Новый пользователь\n\nОтправьте его Telegram ID:",
+                "👤 Новый пользователь\n\nОтправьте его Telegram ID, затем выберите роль:",
                 self._cancel_keyboard("nav:admin"),
             )
         await callback.answer()
@@ -1224,19 +1392,46 @@ class DoorBot:
         if telegram_id is None:
             await message.answer("Telegram ID должен быть положительным целым числом.")
             return
+        await state.update_data(new_user_id=telegram_id)
+        await state.set_state(AdminStates.add_role)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="👤 Постоялец", callback_data="admin_add_role:resident")
+        builder.button(text="🛡 Администратор", callback_data="admin_add_role:admin")
+        builder.button(text="⬅️ Назад", callback_data="nav:admin")
+        builder.button(text="✖️ Отмена", callback_data="fsm_cancel")
+        builder.adjust(2)
+        await message.answer(
+            f"Пользователь: <code>{telegram_id}</code>\n\n"
+            "👤 Постоялец управляет своей дверью и пропусками.\n"
+            "🛡 Администратор дополнительно управляет пользователями и всеми лицами.",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML",
+        )
+
+    async def on_admin_add_role(self, callback: CallbackQuery, state: FSMContext) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        role = callback.data.rsplit(":", 1)[1]
+        data = await state.get_data()
+        telegram_id = int(data.get("new_user_id", 0))
+        if role not in {"admin", "resident"} or telegram_id <= 0:
+            await state.clear()
+            await callback.answer("Данные устарели. Начните заново.", show_alert=True)
+            return
         existing = await self.db.get_user(telegram_id)
-        role = "admin" if existing is not None and existing["role"] == "admin" else "resident"
         await self.db.upsert_user(
             telegram_id,
             existing["username"] if existing is not None else None,
             existing["full_name"] if existing is not None else f"Пользователь {telegram_id}",
             role,
         )
-        if existing is not None and existing["role"] == "blocked":
-            await self.db.set_user_role(telegram_id, "resident")
         await state.clear()
-        await message.answer(f"✅ Пользователь {telegram_id} добавлен или разблокирован.")
-        await self._send_admin_menu(message)
+        role_name = "администратор" if role == "admin" else "постоялец"
+        await callback.answer(f"Роль назначена: {role_name}")
+        message = self._callback_message(callback)
+        if message is not None:
+            await message.answer(f"✅ Пользователь {telegram_id} сохранен как {role_name}.")
+            await self._send_admin_menu(message)
 
     async def on_admin_block(self, callback: CallbackQuery, state: FSMContext) -> None:
         if not await self._require_callback(callback, admin=True):
@@ -1252,19 +1447,11 @@ class DoorBot:
             )
         await callback.answer()
 
-    async def on_admin_block_id(self, message: Message, state: FSMContext) -> None:
-        if not await self._require_message(message, admin=True) or message.from_user is None:
-            return
-        telegram_id = self._parse_telegram_id(message.text or "")
-        if telegram_id is None:
-            await message.answer("Telegram ID должен быть положительным целым числом.")
-            return
-        if telegram_id == message.from_user.id:
-            await message.answer("Нельзя заблокировать собственную учетную запись.")
-            return
+    async def _block_user(self, actor_id: int, telegram_id: int) -> tuple[bool, str]:
+        if telegram_id == actor_id:
+            return False, "Нельзя заблокировать собственную учетную запись."
         if telegram_id in self.settings.admin_ids:
-            await message.answer("Нельзя заблокировать администратора из ADMIN_IDS.")
-            return
+            return False, "Нельзя заблокировать администратора из ADMIN_IDS."
         async with self.db.connection() as connection:
             await connection.execute("BEGIN IMMEDIATE")
             cursor = await connection.execute(
@@ -1272,8 +1459,7 @@ class DoorBot:
             )
             if cursor.rowcount == 0:
                 await connection.rollback()
-                await message.answer("Пользователь не найден.")
-                return
+                return False, "Пользователь не найден."
             await connection.execute(
                 "UPDATE face_embeddings SET is_active = 0 WHERE user_id = ?", (telegram_id,)
             )
@@ -1286,10 +1472,24 @@ class DoorBot:
             )
             await connection.commit()
         await self.db.enqueue_ipc_command("reload_faces", "{}")
-        await state.clear()
-        await message.answer(
-            f"🚫 Пользователь {telegram_id} заблокирован.\nЕго лица, пропуска и курьерские сессии отключены."
+        return True, (
+            f"🚫 Пользователь {telegram_id} заблокирован.\n"
+            "Его лица, пропуска и курьерские сессии отключены."
         )
+
+    async def on_admin_block_id(self, message: Message, state: FSMContext) -> None:
+        if not await self._require_message(message, admin=True) or message.from_user is None:
+            return
+        telegram_id = self._parse_telegram_id(message.text or "")
+        if telegram_id is None:
+            await message.answer("Telegram ID должен быть положительным целым числом.")
+            return
+        changed, text = await self._block_user(message.from_user.id, telegram_id)
+        if not changed:
+            await message.answer(text)
+            return
+        await state.clear()
+        await message.answer(text)
         await self._send_admin_menu(message)
 
     def _available_user_qrs(self, tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1339,7 +1539,134 @@ class DoorBot:
         )
         await callback.answer()
 
+    async def _send_admin_user_card(
+        self,
+        message: Message,
+        actor_id: int,
+        user_id: int,
+        edit: bool = True,
+    ) -> bool:
+        user = await self.db.get_user(user_id)
+        if user is None:
+            return False
+        tokens = self._available_user_qrs(await self.db.list_qr_tokens(user_id))
+        faces = await self.db.list_face_embeddings(user_id)
+        active_faces = sum(1 for face in faces if face["is_active"])
+        role_names = {"admin": "Администратор", "resident": "Постоялец", "blocked": "Заблокирован"}
+        username = f"@{user['username']}" if user["username"] else "не указан"
+        created = time.strftime("%d.%m.%Y", time.localtime(float(user["created_at"])))
+        qr_lines = []
+        for qr in tokens[:5]:
+            label = escape(str(qr["label"]))
+            if qr["expires_at"] is None:
+                qr_lines.append(f"♾️ {label} — без срока")
+            else:
+                expires = time.strftime(
+                    "%d.%m.%Y %H:%M", time.localtime(float(qr["expires_at"]))
+                )
+                qr_lines.append(f"⏳ {label} — до {expires}")
+        if len(tokens) > 5:
+            qr_lines.append(f"… и еще {len(tokens) - 5}")
+        courier = await self.db.get_active_courier_session(user_id)
+        courier_text = "нет"
+        if courier is not None:
+            courier_text = time.strftime(
+                "%d.%m.%Y %H:%M", time.localtime(float(courier["expires_at"]))
+            )
+        text = (
+            f"👤 {escape(str(user['full_name']))}\n\n"
+            f"ID: <code>{user_id}</code>\nUsername: {escape(username)}\n"
+            f"Роль: {role_names.get(str(user['role']), user['role'])}\n"
+            f"Добавлен: {created}\n"
+            f"Лица: {active_faces} активных из {len(faces)}\n"
+            f"Курьерский режим до: {courier_text}\n\n"
+            f"🎟 Действующие пропуска: {len(tokens)}\n"
+            + ("\n".join(qr_lines) if qr_lines else "Нет действующих пропусков.")
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="👥 Управление лицами", callback_data=f"admin_faces:{user_id}")
+        role = str(user["role"])
+        if role == "resident":
+            builder.button(
+                text="🛡 Сделать администратором",
+                callback_data=f"admin_user_role:{user_id}:admin",
+            )
+        elif role == "admin" and user_id != actor_id and user_id not in self.settings.admin_ids:
+            builder.button(
+                text="👤 Сделать постояльцем",
+                callback_data=f"admin_user_role:{user_id}:resident",
+            )
+        if role == "blocked":
+            builder.button(text="✅ Разблокировать", callback_data=f"admin_user_restore:{user_id}")
+        elif user_id != actor_id and user_id not in self.settings.admin_ids:
+            builder.button(text="🚫 Заблокировать", callback_data=f"admin_user_block:{user_id}")
+        builder.button(text="⬅️ К пользователям", callback_data="admin_users")
+        builder.button(text="🛡 Админ-панель", callback_data="nav:admin")
+        builder.adjust(1)
+        if edit:
+            await self._edit_message(message, text, builder.as_markup(), parse_mode="HTML")
+        else:
+            await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        return True
+
     async def on_user_view(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        message = self._callback_message(callback)
+        if message is None:
+            await callback.answer("Сообщение недоступно", show_alert=True)
+            return
+        if not await self._send_admin_user_card(message, callback.from_user.id, user_id):
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        await callback.answer()
+
+    async def on_admin_user_role(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            _, raw_user_id, role = callback.data.split(":", 2)
+            user_id = int(raw_user_id)
+        except ValueError:
+            await callback.answer("Некорректные данные роли", show_alert=True)
+            return
+        if role not in {"admin", "resident"}:
+            await callback.answer("Некорректная роль", show_alert=True)
+            return
+        if role == "resident" and user_id == callback.from_user.id:
+            await callback.answer("Нельзя снять роль администратора с себя", show_alert=True)
+            return
+        if role == "resident" and user_id in self.settings.admin_ids:
+            await callback.answer("Этот администратор задан через ADMIN_IDS", show_alert=True)
+            return
+        if not await self.db.set_user_role(user_id, role):
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        await callback.answer("Роль обновлена")
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_admin_user_card(message, callback.from_user.id, user_id)
+
+    async def on_admin_user_block(self, callback: CallbackQuery) -> None:
+        if not await self._require_callback(callback, admin=True):
+            return
+        try:
+            user_id = int(callback.data.rsplit(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный ID", show_alert=True)
+            return
+        changed, text = await self._block_user(callback.from_user.id, user_id)
+        await callback.answer(text, show_alert=True)
+        message = self._callback_message(callback)
+        if changed and message is not None:
+            await self._send_admin_user_card(message, callback.from_user.id, user_id)
+
+    async def on_admin_user_restore(self, callback: CallbackQuery) -> None:
         if not await self._require_callback(callback, admin=True):
             return
         try:
@@ -1351,50 +1678,14 @@ class DoorBot:
         if user is None:
             await callback.answer("Пользователь не найден", show_alert=True)
             return
-        message = self._callback_message(callback)
-        if message is None:
-            await callback.answer("Сообщение недоступно", show_alert=True)
+        if user["role"] != "blocked":
+            await callback.answer("Пользователь не заблокирован", show_alert=True)
             return
-        tokens = self._available_user_qrs(await self.db.list_qr_tokens(user_id))
-        faces = await self.db.list_face_embeddings(user_id)
-        active_faces = sum(1 for face in faces if face["is_active"])
-        role_names = {"admin": "Администратор", "resident": "Постоялец", "blocked": "Заблокирован"}
-        username = f"@{user['username']}" if user["username"] else "не указан"
-        created = time.strftime("%d.%m.%Y", time.localtime(float(user["created_at"])))
-        qr_lines = []
-        for qr in tokens[:5]:
-            if qr["expires_at"] is None:
-                qr_lines.append(f"♾️ {qr['label']} — без срока")
-            else:
-                expires = time.strftime(
-                    "%d.%m.%Y %H:%M", time.localtime(float(qr["expires_at"]))
-                )
-                qr_lines.append(f"⏳ {qr['label']} — до {expires}")
-        if len(tokens) > 5:
-            qr_lines.append(f"… и еще {len(tokens) - 5}")
-        courier = await self.db.get_active_courier_session(user_id)
-        courier_text = "нет"
-        if courier is not None:
-            courier_text = time.strftime(
-                "%d.%m.%Y %H:%M", time.localtime(float(courier["expires_at"]))
-            )
-        text = (
-            f"👤 {user['full_name']}\n\n"
-            f"ID: {user_id}\nUsername: {username}\n"
-            f"Роль: {role_names.get(str(user['role']), user['role'])}\n"
-            f"Добавлен: {created}\n"
-            f"Лица: {active_faces} активных из {len(faces)}\n"
-            f"Курьерский режим до: {courier_text}\n\n"
-            f"🎟 Действующие пропуска: {len(tokens)}\n"
-            + ("\n".join(qr_lines) if qr_lines else "Нет действующих пропусков.")
-        )
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ К пользователям", callback_data="admin_users")
-        builder.button(text="🛡 Админ-панель", callback_data="nav:admin")
-        builder.button(text="🏠 Главное меню", callback_data="nav:main")
-        builder.adjust(1)
-        await self._edit_message(message, text, builder.as_markup())
-        await callback.answer()
+        await self.db.set_user_role(user_id, "resident")
+        await callback.answer("Пользователь разблокирован как постоялец")
+        message = self._callback_message(callback)
+        if message is not None:
+            await self._send_admin_user_card(message, callback.from_user.id, user_id)
 
     @staticmethod
     def _parse_telegram_id(value: str) -> int | None:
@@ -1616,28 +1907,59 @@ class DoorBot:
             if existing is not None and existing["role"] != "admin":
                 await self.db.set_user_role(admin_id, "admin")
 
-    async def run(self) -> None:
-        await self.db.init()
-        await self._close_expired_courier_qrs()
-        await self._initialize_admins()
-        telegram_user = await self.bot.get_me()
-        if telegram_user.username:
-            self.bot_username = telegram_user.username
-        await self.bot.set_my_commands(
-            [
-                BotCommand(command="start", description="Начать работу"),
-                BotCommand(command="menu", description="Главное меню"),
-                BotCommand(command="cancel", description="Отменить текущее действие"),
-            ]
-        )
-        dispatcher = Dispatcher(storage=MemoryStorage())
-        dispatcher.include_router(self.router)
-        outbox_task = asyncio.create_task(self.outbox_dispatcher(), name="outbox-dispatcher")
+    async def _start_http_server(self) -> None:
+        if not self.settings.public_base_url:
+            return
+        application = web.Application()
+        application.router.add_get("/open/{kind}/{token}", self._http_open)
+        runner = web.AppRunner(application)
+        await runner.setup()
         try:
+            site = web.TCPSite(
+                runner,
+                host=self.settings.http_host,
+                port=self.settings.http_port,
+            )
+            await site.start()
+        except Exception:
+            await runner.cleanup()
+            raise
+        self._http_runner = runner
+        logger.info(
+            "HTTP-ссылки доступа включены: %s, listen=%s:%d",
+            self.settings.public_base_url,
+            self.settings.http_host,
+            self.settings.http_port,
+        )
+
+    async def run(self) -> None:
+        outbox_task: asyncio.Task[None] | None = None
+        try:
+            await self.db.init()
+            await self._close_expired_courier_qrs()
+            await self._initialize_admins()
+            telegram_user = await self.bot.get_me()
+            if telegram_user.username:
+                self.bot_username = telegram_user.username
+            await self.bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Начать работу"),
+                    BotCommand(command="menu", description="Главное меню"),
+                    BotCommand(command="cancel", description="Отменить текущее действие"),
+                ]
+            )
+            dispatcher = Dispatcher(storage=MemoryStorage())
+            dispatcher.include_router(self.router)
+            await self._start_http_server()
+            outbox_task = asyncio.create_task(self.outbox_dispatcher(), name="outbox-dispatcher")
             await dispatcher.start_polling(self.bot)
         finally:
-            outbox_task.cancel()
-            await asyncio.gather(outbox_task, return_exceptions=True)
+            if outbox_task is not None:
+                outbox_task.cancel()
+                await asyncio.gather(outbox_task, return_exceptions=True)
+            if self._http_runner is not None:
+                await self._http_runner.cleanup()
+                self._http_runner = None
             await self.bot.session.close()
 
 

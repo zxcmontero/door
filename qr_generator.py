@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import secrets
 from io import BytesIO
+from urllib.parse import urlsplit
 
 import qrcode
 from PIL import Image
@@ -19,15 +20,17 @@ def generate_token() -> str:
     return secrets.token_hex(4)
 
 
-def render_qr_png(token: str) -> bytes:
+def render_qr_png(token: str, payload: str | None = None) -> bytes:
     if not TOKEN_PATTERN.fullmatch(token):
         raise ValueError("QR-токен должен состоять из 8 латинских букв или цифр")
+    if payload is not None and not payload.strip():
+        raise ValueError("Содержимое QR не может быть пустым")
     qr = qrcode.QRCode(
         error_correction=ERROR_CORRECT_M,
         box_size=12,
         border=4,
     )
-    qr.add_data(f"DOOR:{token}")
+    qr.add_data(payload or f"DOOR:{token}")
     qr.make(fit=True)
     qr_image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     framed = Image.new(
@@ -50,3 +53,36 @@ def build_deep_link(bot_username: str, token: str, kind: str = "qr") -> str:
     if kind not in {"qr", "cour"}:
         raise ValueError("Тип deep link должен быть qr или cour")
     return f"https://t.me/{username}?start={kind}_{token}"
+
+
+def build_http_link(base_url: str, token: str, kind: str = "qr") -> str:
+    base_url = base_url.strip().rstrip("/")
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("PUBLIC_BASE_URL должен быть HTTP(S) URL без учетных данных, query и fragment")
+    if not TOKEN_PATTERN.fullmatch(token):
+        raise ValueError("QR-токен должен состоять из 8 латинских букв или цифр")
+    if kind not in {"qr", "cour"}:
+        raise ValueError("Тип ссылки должен быть qr или cour")
+    return f"{base_url}/open/{kind}/{token}"
+
+
+def extract_token(payload: str) -> str | None:
+    text = payload.strip()
+    if text.startswith("DOOR:"):
+        token = text[5:].strip()
+        return token if TOKEN_PATTERN.fullmatch(token) else None
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 3 or parts[-3] != "open" or parts[-2] not in {"qr", "cour"}:
+        return None
+    token = parts[-1]
+    return token if TOKEN_PATTERN.fullmatch(token) else None
