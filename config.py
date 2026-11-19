@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 
 
 class ConfigError(ValueError):
@@ -83,6 +82,8 @@ def _parse_admin_ids() -> frozenset[int]:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
+    app_env: str
+    actuator_mode: str
     bot_token: str
     bot_username: str
     admin_ids: frozenset[int]
@@ -91,6 +92,9 @@ class Settings:
     dahua_user: str
     dahua_password: str
     dahua_rtsp_port: int
+    dahua_channel: int
+    actuator_open_ttl_seconds: int
+    actuator_timeout_seconds: int
     database_path: Path
     media_dir: Path
     face_tasks_dir: Path
@@ -110,9 +114,27 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        dahua_ip = _required("DAHUA_IP").rstrip("/")
-        if "://" in dahua_ip:
-            raise ConfigError("DAHUA_IP должен содержать только адрес устройства, без http://")
+        app_env = os.getenv("APP_ENV", "test").strip().lower()
+        if app_env not in {"test", "pilot", "production"}:
+            raise ConfigError("APP_ENV должен быть test, pilot или production")
+        actuator_mode = os.getenv("ACTUATOR_MODE", "test").strip().lower()
+        if actuator_mode not in {"test", "dahua"}:
+            raise ConfigError("ACTUATOR_MODE должен быть test или dahua")
+        if app_env == "test" and actuator_mode == "dahua":
+            raise ConfigError("ACTUATOR_MODE=dahua запрещен при APP_ENV=test")
+
+        dahua_ip = os.getenv("DAHUA_IP", "").strip()
+        if "://" in dahua_ip or "/" in dahua_ip:
+            raise ConfigError("DAHUA_IP должен содержать только адрес устройства, без схемы и /")
+        if actuator_mode == "dahua":
+            if not dahua_ip:
+                raise ConfigError("Не задана обязательная переменная окружения DAHUA_IP")
+            dahua_user = _required("DAHUA_USER")
+            dahua_password = _required("DAHUA_PASS")
+        else:
+            dahua_user = os.getenv("DAHUA_USER", "").strip()
+            dahua_password = os.getenv("DAHUA_PASS", "").strip()
+
         log_chat_id_raw = os.getenv("LOG_CHAT_ID", "").strip()
         log_chat_id = _integer("LOG_CHAT_ID") if log_chat_id_raw else None
         similarity = _positive_float("FACE_SIMILARITY_THRESHOLD", 0.48)
@@ -135,14 +157,19 @@ class Settings:
         if not http_host:
             raise ConfigError("HTTP_HOST не может быть пустым")
         return cls(
+            app_env=app_env,
+            actuator_mode=actuator_mode,
             bot_token=_required("BOT_TOKEN"),
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@"),
             admin_ids=_parse_admin_ids(),
             log_chat_id=log_chat_id,
             dahua_ip=dahua_ip,
-            dahua_user=_required("DAHUA_USER"),
-            dahua_password=_required("DAHUA_PASS"),
+            dahua_user=dahua_user,
+            dahua_password=dahua_password,
             dahua_rtsp_port=_positive_integer("DAHUA_RTSP_PORT", 554),
+            dahua_channel=_positive_integer("DAHUA_CHANNEL", 1),
+            actuator_open_ttl_seconds=_positive_integer("ACTUATOR_OPEN_TTL_SECONDS", 5),
+            actuator_timeout_seconds=_positive_integer("ACTUATOR_TIMEOUT_SECONDS", 10),
             database_path=_path("DATABASE_PATH", "data/access.db"),
             media_dir=_path("MEDIA_DIR", "data/media"),
             face_tasks_dir=_path("FACE_TASKS_DIR", "data/face_tasks"),
@@ -171,7 +198,7 @@ class Settings:
         password = quote(self.dahua_password, safe="")
         return (
             f"rtsp://{user}:{password}@{self.dahua_ip}:{self.dahua_rtsp_port}"
-            "/cam/realmonitor?channel=1&subtype=0"
+            f"/cam/realmonitor?channel={self.dahua_channel}&subtype=0"
         )
 
     def ensure_directories(self) -> None:
@@ -183,6 +210,7 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    load_dotenv(BASE_DIR / ".env")
     settings = Settings.from_env()
     settings.ensure_directories()
     return settings

@@ -21,6 +21,7 @@ from insightface.app import FaceAnalysis
 from config import Settings, get_settings
 from dahua_client import DahuaClient, DahuaEvent
 from database import SyncDatabase
+from door_access.actuators import DahuaActuator, TestActuator
 from qr_generator import extract_token
 from version import __version__
 
@@ -261,6 +262,14 @@ class CVWorker:
         self.dahua = DahuaClient(
             settings.dahua_ip, settings.dahua_user, settings.dahua_password
         )
+        if settings.actuator_mode == "test":
+            self.actuator = TestActuator()
+        else:
+            self.actuator = DahuaActuator(
+                self.dahua,
+                channel=settings.dahua_channel,
+                timeout_seconds=settings.actuator_timeout_seconds,
+            )
         self.capture = FrameCapture(settings.rtsp_url, settings.rtsp_fps, settings.pre_roll_seconds)
         self.motion = MotionDetector()
         self.face_engine = FaceEngine()
@@ -372,7 +381,14 @@ class CVWorker:
             if not self._unlock_ready():
                 return False
             pre_roll = self.capture.pre_roll()
-            await self.dahua.unlock_door()
+            if event.user_id is None:
+                raise ValueError("user_id обязателен для открытия двери")
+            opened = await self.actuator.open(
+                event.user_id,
+                ttl_seconds=self.settings.actuator_open_ttl_seconds,
+            )
+            if not opened:
+                raise RuntimeError("Actuator не подтвердил открытие двери")
             self._last_unlock_ts = time.time()
             try:
                 await asyncio.to_thread(self.db.record_unlock, self._last_unlock_ts)

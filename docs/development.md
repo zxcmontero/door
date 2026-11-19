@@ -18,18 +18,13 @@
 - SQLite и OpenCV.
 - Системные библиотеки FFmpeg/GStreamer только для декодирования видео, не для создания архива.
 
-Зависимости разделяются на:
+Текущие runtime-зависимости находятся в `requirements.txt`. Development-окружение устанавливается через `requirements/dev.txt`, который включает runtime-зависимости и фиксированный `pytest`:
 
-```text
-requirements/
-├── base.txt
-├── gpu.txt
-└── dev.txt
+```bash
+python -m pip install -r requirements/dev.txt
 ```
 
-- `base.txt`: приложение, SQLite, Telegram, HTTP, OpenCV, ZXing.
-- `gpu.txt`: совместимые InsightFace, `onnxruntime-gpu`, CUDA/cuDNN constraints.
-- `dev.txt`: pytest и вспомогательные test doubles.
+Целевое разделение на `requirements/base.txt`, `requirements/gpu.txt` и `requirements/dev.txt` выполняется отдельно: `base.txt` предназначен для приложения, SQLite, Telegram, HTTP, OpenCV и ZXing, `gpu.txt` — для совместимых InsightFace, `onnxruntime-gpu` и CUDA/cuDNN constraints, `dev.txt` — для pytest и вспомогательных test doubles.
 
 Версии GPU-стека фиксируются после проверки совместимости на целевом сервере. Официальные источники и hashes/constraints используются для воспроизводимости; установщики не хранятся в репозитории.
 
